@@ -4362,10 +4362,17 @@ public:
     auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
     auto &props = pRenderTargetView->description();
 
-    EmitOP([texture = pRenderTargetView->texture(), view = pRenderTargetView->viewId(),
-          clear_color = std::move(clear_color), array_length = props.RenderTargetArrayLength](ArgumentEncodingContext &enc) mutable {
-      enc.clearColor(forward_rc(texture), view, array_length, clear_color);
-    });
+    if (pRenderTargetView->isBufferView()) {
+      EmitOP([buffer = pRenderTargetView->buffer(), view = pRenderTargetView->viewId(),
+            clear_color = std::move(clear_color), width = props.Width](ArgumentEncodingContext &enc) mutable {
+        enc.clearColor(forward_rc(buffer), view, width, clear_color);
+      });
+    } else {
+      EmitOP([texture = pRenderTargetView->texture(), view = pRenderTargetView->viewId(),
+            clear_color = std::move(clear_color), array_length = props.RenderTargetArrayLength](ArgumentEncodingContext &enc) mutable {
+        enc.clearColor(forward_rc(texture), view, array_length, clear_color);
+      });
+    }
   }
 
   void
@@ -4432,7 +4439,9 @@ public:
       /* Setup RenderCommandEncoder */
       struct RENDER_TARGET_STATE {
         Rc<Texture> Texture;
+        Rc<Buffer> Buffer;
         uint64_t viewId;
+        BufferSlice slice;
         UINT RenderTargetIndex;
         UINT DepthPlane;
         WMTPixelFormat PixelFormat = WMTPixelFormatInvalid;
@@ -4446,7 +4455,7 @@ public:
         auto &rtv = state_.OutputMerger.RTVs[i];
         if (rtv) {
           auto props = rtv->description();
-          rtvs[i] = {rtv->texture(), rtv->viewId(), i, props.DepthPlane, rtv->pixelFormat()};
+          rtvs[i] = {rtv->texture(), rtv->buffer(), rtv->viewId(), rtv->bufferSlice(), i, props.DepthPlane, rtv->pixelFormat()};
           D3D11_ASSERT(rtv->pixelFormat() != WMTPixelFormatInvalid);
           effective_render_target++;
         } else {
@@ -4503,8 +4512,40 @@ public:
           if (rtv.PixelFormat == WMTPixelFormatInvalid) {
             continue;
           }
+          if (!rtv.Texture.ptr() && !rtv.Buffer.ptr()) {
+            WARN("RenderPass: RTV has no texture slot=", rtv.RenderTargetIndex,
+                 " view=", uint64_t(rtv.viewId), " format=", uint32_t(rtv.PixelFormat));
+            continue;
+          }
+          if (rtv.Texture.ptr() && !(rtv.Texture->usage() & WMTTextureUsageRenderTarget)) {
+            WARN(
+                "RenderPass: RTV texture missing WMTTextureUsageRenderTarget",
+                " slot=", rtv.RenderTargetIndex,
+                " view=", uint64_t(rtv.viewId),
+                " usage=", uint32_t(rtv.Texture->usage()),
+                " view_format=", uint32_t(rtv.PixelFormat),
+                " texture_format=", uint32_t(rtv.Texture->pixelFormat()),
+                " texture_type=", uint32_t(rtv.Texture->textureType()),
+                " size=", rtv.Texture->width(), "x", rtv.Texture->height(), "x", rtv.Texture->depth(),
+                " array_size=", rtv.Texture->arrayLength(),
+                " mip_levels=", rtv.Texture->miplevelCount(),
+                " sample_count=", rtv.Texture->sampleCount()
+            );
+            continue;
+          }
           auto &color = info.colors[rtv.RenderTargetIndex];
-          color.attachment = ctx.access<PipelineStage::Pixel>(rtv.Texture, rtv.viewId, ResourceAccess::ReadWrite);
+          if (rtv.Buffer.ptr()) {
+            auto [view, suballocation_offset] =
+                ctx.access<PipelineStage::Pixel>(rtv.Buffer, rtv.viewId, ResourceAccess::ReadWrite);
+            if (suballocation_offset)
+              WARN("RenderPass: buffer RTV suballocation offset is not supported offset=", suballocation_offset);
+            auto bufferRTVTexture = view.texture;
+            color.buffer_attachment = rtv.Buffer;
+            color.buffer_texture = std::move(bufferRTVTexture);
+            color.buffer_view_id = rtv.viewId;
+          } else {
+            color.attachment = ctx.access<PipelineStage::Pixel>(rtv.Texture, rtv.viewId, ResourceAccess::ReadWrite);
+          }
           color.depth_plane = rtv.DepthPlane;
           color.load_action = WMTLoadActionLoad;
           color.store_action = WMTStoreActionStore;

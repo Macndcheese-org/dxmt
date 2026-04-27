@@ -487,6 +487,33 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
 }
 
 void
+ArgumentEncodingContext::clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width, WMTClearColor color) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<ClearEncoderData>();
+  encoder_info->type = EncoderType::Clear;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_info->clear_dsv = 0;
+  encoder_info->color = color;
+  encoder_info->array_length = 0;
+  encoder_info->width = width;
+  encoder_info->height = 1;
+  encoder_current = encoder_info;
+
+  auto [view, suballocation_offset] = access<PipelineStage::Pixel>(buffer, viewId, ResourceAccess::Write);
+  if (suballocation_offset)
+    WARN("ClearRenderTargetView: buffer RTV suballocation offset is not supported offset=", suballocation_offset);
+  encoder_info->buffer_attachment = std::move(buffer);
+  encoder_info->buffer_view_id = viewId;
+  encoder_info->buffer_texture = view.texture;
+
+  currentFrameStatistics().clear_pass_count++;
+
+  endPass();
+}
+
+void
 ArgumentEncodingContext::clearDepthStencil(
     Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
 ) {
@@ -914,10 +941,13 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       {
         for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
           auto &color_data = data->colors[i];
-          if (!color_data.attachment)
+          if (!color_data.attachment && !color_data.buffer_texture)
             continue;
           auto &color_info = render_pass_info.colors[i];
-          color_info.texture = color_data.attachment.texture();
+          // a buffer-backed RTV supplies its Metal texture view directly, rather than
+          // through a TextureViewRef attachment as a texture RTV does
+          color_info.texture = color_data.attachment ? color_data.attachment.texture()
+                                                     : color_data.buffer_texture;
           color_info.load_action = color_data.load_action;
           color_info.store_action = color_data.store_action;
           color_info.level = color_data.level;
@@ -1126,7 +1156,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           info.render_target_height = data->height;
         } else {
           info.colors[0].clear_color = data->color;
-          info.colors[0].texture = data->attachment.texture();
+          // same as the render-pass path: a buffer-backed target carries its Metal
+          // texture view directly
+          info.colors[0].texture =
+              data->attachment ? data->attachment.texture() : data->buffer_texture;
           info.colors[0].load_action = WMTLoadActionClear;
           info.colors[0].store_action = WMTStoreActionStore;
         }
@@ -1517,9 +1550,13 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
     auto &a1 = r1->colors[i];
     if (a0.attachment != a1.attachment)
       return false;
+    if (a0.buffer_attachment.ptr() != a1.buffer_attachment.ptr())
+      return false;
+    if (a0.buffer_view_id != a1.buffer_view_id)
+      return false;
     if (a0.depth_plane != a1.depth_plane)
       return false;
-    if (!a0.attachment)
+    if (!a0.attachment && !a0.buffer_texture)
       continue;
     if (a0.store_action != WMTStoreActionStore)
       return false;
@@ -1534,6 +1571,11 @@ ArgumentEncodingContext::isClearColorSignatureMatched(ClearEncoderData *clear, R
   for (unsigned i = 0; i < render->render_target_count; i++) {
     auto &attachment = render->colors[i];
     if (attachment.attachment == clear->attachment) {
+      return &attachment;
+    }
+    if (attachment.buffer_attachment.ptr() &&
+        attachment.buffer_attachment.ptr() == clear->buffer_attachment.ptr() &&
+        attachment.buffer_view_id == clear->buffer_view_id) {
       return &attachment;
     }
   }

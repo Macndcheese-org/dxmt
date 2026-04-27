@@ -68,6 +68,10 @@ struct BufferViewKey {
 
 struct BufferViewDescriptor {
   WMTPixelFormat format;
+  WMTTextureUsage usage = WMTTextureUsageShaderRead;
+  WMTTextureType type = WMTTextureTypeTextureBuffer;
+  uint32_t byteOffset = 0;
+  uint32_t byteLength = 0;
 };
 
 class Buffer;
