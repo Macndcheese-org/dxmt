@@ -347,8 +347,7 @@ public:
       render->render_target_height = render_target_height;
       render->render_target_array_length = render_target_array_length;
       if (effective_rtvs == 0) {
-        IMPLEMENT_ME
-        // render->default_raster_sample_count = std::max(1u, forced_sample_count);
+        render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
       }
 
       if (pso_graphics_) {
@@ -599,7 +598,9 @@ public:
         cmd_cp.src = src->current()->buffer();
         cmd_cp.src_offset = pSrc->PlacedFootprint.Offset;
         cmd_cp.bytes_per_row = pSrc->PlacedFootprint.Footprint.RowPitch;
-        cmd_cp.bytes_per_image = 0;
+        cmd_cp.bytes_per_image = dst->textureType() == WMTTextureType3D
+                                     ? pSrc->PlacedFootprint.Footprint.Height * pSrc->PlacedFootprint.Footprint.RowPitch
+                                     : 0;
         cmd_cp.size = {
             pSrc->PlacedFootprint.Footprint.Width, pSrc->PlacedFootprint.Footprint.Height,
             pSrc->PlacedFootprint.Footprint.Depth
@@ -661,7 +662,9 @@ public:
         cmd_cp.dst = dst->current()->buffer();
         cmd_cp.offset = pDst->PlacedFootprint.Offset;
         cmd_cp.bytes_per_row = pDst->PlacedFootprint.Footprint.RowPitch;
-        cmd_cp.bytes_per_image = 0;
+        cmd_cp.bytes_per_image = src->textureType() == WMTTextureType3D
+                                     ? pDst->PlacedFootprint.Footprint.Height * pDst->PlacedFootprint.Footprint.RowPitch
+                                     : 0;
       } else {
         // so it is buffer to buffer copy?
         IMPLEMENT_ME
@@ -669,7 +672,34 @@ public:
     }
   };
 
-  void STDMETHODCALLTYPE CopyResource(ID3D12Resource *pDstResource, ID3D12Resource *pSrcResource) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  CopyResource(ID3D12Resource *pDstResource, ID3D12Resource *pSrcResource) {
+    auto *pDst = static_cast<MTLD3D12Resource *>(pDstResource);
+    auto *pSrc = static_cast<MTLD3D12Resource *>(pSrcResource);
+    if (!pDst || !pSrc || (pDst == pSrc))
+      return;
+
+    auto DstDesc = pDst->GetDesc();
+    auto SrcDesc = pSrc->GetDesc();
+    if (DstDesc.Dimension != SrcDesc.Dimension)
+      return;
+
+    if (!PreBlit())
+      return;
+
+    if (DstDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+      cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+      cmd_cp.copy_length = SrcDesc.Width;
+      cmd_cp.src = pSrc->buffer->current()->buffer();
+      cmd_cp.src_offset = 0;
+      cmd_cp.dst = pDst->buffer->current()->buffer();
+      cmd_cp.dst_offset = 0;
+      return;
+    }
+
+    IMPLEMENT_ME
+  };
 
   void STDMETHODCALLTYPE CopyTiles(
       ID3D12Resource *tiled_resource, const D3D12_TILED_RESOURCE_COORDINATE *tile_region_start_coordinate,
@@ -683,7 +713,52 @@ public:
       ID3D12Resource *pDstResource, UINT DstSubresource, ID3D12Resource *pSrcResource, UINT SrcSubresource,
       DXGI_FORMAT Format
   ) {
-    IMPLEMENT_ME
+    auto *pDst = static_cast<MTLD3D12Resource *>(pDstResource);
+    auto *pSrc = static_cast<MTLD3D12Resource *>(pSrcResource);
+
+    if (!pDst->texture || !pSrc->texture)
+      return;
+
+    auto DstMips = pDst->texture->miplevelCount();
+    auto DstLevel = DstSubresource % DstMips;
+    auto DstSlice = DstSubresource / DstMips;
+
+    allocator_->InvalidateCurrentPass();
+    auto resolve = allocator_->AllocatePass<ResolveEncoderData>();
+    resolve->type = EncoderType::Resolve;
+
+    MTL_DXGI_FORMAT_DESC format_desc;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc))) {
+      ERR("ResolveSubresource: invalid format ", Format);
+      return;
+    }
+    {
+      auto format = format_desc.PixelFormat;
+      TextureViewDescriptor src_desc;
+      auto &src = pSrc->texture;
+      auto &dst = pDst->texture;
+      src_desc.format = format;
+      src_desc.type = src->textureType();
+      src_desc.arraySize = 1;
+      src_desc.firstArraySlice = SrcSubresource; // src must be a MS(Array) texture which has exactly 1 mipmap level
+      src_desc.miplevelCount = 1;
+      src_desc.firstMiplevel = 0;
+
+      TextureViewDescriptor dst_desc;
+      dst_desc.format = format;
+      dst_desc.type = WMTTextureType2D;
+      dst_desc.arraySize = 1;
+      dst_desc.firstArraySlice = DstSlice;
+      dst_desc.miplevelCount = 1;
+      dst_desc.firstMiplevel = DstLevel;
+
+      auto src_view = src->createView(src_desc);
+      auto dst_view = dst->createView(dst_desc);
+
+      resolve->src = src->view(src_view);
+      resolve->dst = dst->view(dst_view);
+    }
+    allocator_->InvalidateCurrentPass();
   };
 
   void STDMETHODCALLTYPE
@@ -953,8 +1028,11 @@ public:
 
   void STDMETHODCALLTYPE
   IASetVertexBuffers(UINT StartSlot, UINT Count, const D3D12_VERTEX_BUFFER_VIEW *Views) {
+    if (!Views)
+      return;
+    
     for (unsigned Slot = StartSlot; Slot < StartSlot + Count; Slot++) {
-      vertex_buffers_[Slot] = Views ? Views[Slot - StartSlot] : D3D12_VERTEX_BUFFER_VIEW{};
+      vertex_buffers_[Slot] = Views[Slot - StartSlot];
     }
     dirty_state_.set(DirtyState::VertexBuffer);
   };
@@ -1033,18 +1111,112 @@ public:
     allocator_->InvalidateCurrentPass();
   };
 
-  void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(
+  void STDMETHODCALLTYPE
+  ClearUnorderedAccessViewUint(
       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
       const UINT Values[4], UINT RectCount, const D3D12_RECT *pRects
   ) {
-    IMPLEMENT_ME
+    auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
+    auto &Descriptor = Heap->GetDescriptor(Index);
+    auto color = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]});
+    D3D12_RECT full_rect;
+    switch (Descriptor.type) {
+    case ShaderVisibleDescriptorType::UAVBuffer: {
+      allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+      full_rect = {
+          (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
+          (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
+      };
+      break;
+    }
+    case ShaderVisibleDescriptorType::UAVTexture: {
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
+      full_rect = {
+          0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
+          (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
+      };
+      break;
+    }
+    case ShaderVisibleDescriptorType::UAVTexelBuffer: {
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
+      full_rect = {
+          (LONG)Descriptor.UAVTexelBuffer.slice.firstElement, 0,
+          (LONG)(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
+      };
+      break;
+    }
+    default:
+      allocator_->clear_uav_.end();
+      return;
+    }
+
+    const D3D12_RECT *rects = RectCount > 0 ? pRects : &full_rect;
+    UINT rect_count = RectCount > 0 ? RectCount : 1;
+
+    for (unsigned i = 0; i < rect_count; i++) {
+      auto &rect = rects[i];
+      auto width = rect.right - rect.left;
+      auto height = rect.bottom - rect.top;
+      if (width <= 0 || height <= 0)
+        continue;
+      allocator_->clear_uav_.clear(rect.left, rect.top, width, height);
+    }
+
+    allocator_->clear_uav_.end();
   };
 
-  void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(
+  void STDMETHODCALLTYPE
+  ClearUnorderedAccessViewFloat(
       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
       const float Values[4], UINT RectCount, const D3D12_RECT *pRects
   ) {
-    IMPLEMENT_ME
+    auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
+    auto &Descriptor = Heap->GetDescriptor(Index);
+    auto color = std::array<float, 4>({Values[0], Values[1], Values[2], Values[3]});
+    D3D12_RECT full_rect;
+    switch (Descriptor.type) {
+    case ShaderVisibleDescriptorType::UAVBuffer: {
+      allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+      full_rect = {
+          (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
+          (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
+      };
+      break;
+    }
+    case ShaderVisibleDescriptorType::UAVTexture: {
+      allocator_->clear_uav_.begin(color, Descriptor.SRVTexture.texture, Descriptor.SRVTexture.view);
+      full_rect = {
+          0, 0, (LONG)Descriptor.SRVTexture.texture->width(Descriptor.SRVTexture.view),
+          (LONG)Descriptor.SRVTexture.texture->height(Descriptor.SRVTexture.view)
+      };
+      break;
+    }
+    case ShaderVisibleDescriptorType::UAVTexelBuffer: {
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
+      full_rect = {
+          (LONG)Descriptor.UAVTexelBuffer.slice.firstElement, 0,
+          (LONG)(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
+      };
+      break;
+    }
+    default:
+      allocator_->clear_uav_.end();
+      return;
+    }
+
+    const D3D12_RECT *rects = RectCount > 0 ? pRects : &full_rect;
+    UINT rect_count = RectCount > 0 ? RectCount : 1;
+
+    for (unsigned i = 0; i < rect_count; i++) {
+      auto &rect = rects[i];
+      auto width = rect.right - rect.left;
+      auto height = rect.bottom - rect.top;
+      if (width <= 0 || height <= 0)
+        continue;
+      allocator_->clear_uav_.clear(rect.left, rect.top, width, height);
+    }
+
+    allocator_->clear_uav_.end();
   };
 
   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *pResource, const D3D12_DISCARD_REGION *pRegion) {
