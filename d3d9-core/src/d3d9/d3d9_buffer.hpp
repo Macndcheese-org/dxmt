@@ -52,7 +52,7 @@ public:
 
   // Metal buffer the GPU reads: the DynamicBuffer's current allocation
   // buffer (a Lock(DISCARD) renames it via updateImmediateName). Both map
-  // modes route through the wrapper now, so the arm no longer branches.
+  // modes route through the wrapper, so the arm does not branch.
   WMT::Buffer
   metalBuffer() const {
     return m_dynamic->immediateName()->buffer();
@@ -128,6 +128,13 @@ private:
   // longer matches it; WHICH bytes differ is deliberately not tracked, because
   // the application does not truthfully say (d3d9_buffer_map.hpp).
   bool m_dirty = false;
+  // A write lock that is still outstanding. An application may hold a buffer
+  // mapped across many draws and write each region just before the draw that
+  // reads it, without ever re-locking, so the lock is the only announcement we
+  // get and it arrives once. Clearing the dirty flag on the first refresh would
+  // then leave every later write unpublished. While this is set, a refresh
+  // re-uploads unconditionally.
+  bool m_writeLocked = false;
   // Nested Lock/Unlock depth; the upload fires on the outer Unlock only.
   D3D9BufferLockCount m_lockCount;
   // The process-owned host mirror, never registered with Metal; the dtor
@@ -139,7 +146,7 @@ private:
   D3DPOOL m_pool;
   DWORD m_priority = 0;
   // Same exactly-once-drop pattern as MTLD3D9Surface / MTLD3D9Texture:
-  // the ctor self-pin must be released only on the FIRST pub→0
+  // the ctor self-pin must be released only on the FIRST pub->0
   // transition, otherwise a Get/Release cycle on a slot-pinned buffer
   // (m_vertexBuffers[N]) over-decrements priv and destructs.
   bool m_self_pinned = true;
@@ -239,6 +246,13 @@ private:
   // longer matches it; WHICH bytes differ is deliberately not tracked, because
   // the application does not truthfully say (d3d9_buffer_map.hpp).
   bool m_dirty = false;
+  // A write lock that is still outstanding. An application may hold a buffer
+  // mapped across many draws and write each region just before the draw that
+  // reads it, without ever re-locking, so the lock is the only announcement we
+  // get and it arrives once. Clearing the dirty flag on the first refresh would
+  // then leave every later write unpublished. While this is set, a refresh
+  // re-uploads unconditionally.
+  bool m_writeLocked = false;
   D3D9BufferLockCount m_lockCount;
   UINT m_size;
   DWORD m_usage;

@@ -126,7 +126,7 @@ isBlockAlignedCreate(D3DFORMAT format, UINT width, UINT height) {
   return (width & 3u) == 0u && (height & 3u) == 0u;
 }
 
-// D3DDECLTYPE → MTLAttributeFormat (dxbc_signature.cpp mirrors the table).
+// D3DDECLTYPE -> MTLAttributeFormat (dxbc_signature.cpp mirrors the table).
 // D3DCOLOR legacy 0xAARRGGBB layout matches Metal's UChar4Normalized_BGRA.
 // UDEC3 / DEC3N packed formats need custom unpack; not covered.
 inline uint32_t
@@ -178,7 +178,7 @@ to_mtl_attr_format(BYTE type) {
   }
 }
 
-// D3DPRIMITIVETYPE → Metal primitive class. The Metal type enum is at
+// D3DPRIMITIVETYPE -> Metal primitive class. The Metal type enum is at
 // winemetal.h; the D3D9 enum is contiguous from 1
 // (D3DPT_POINTLIST). D3D9 fans have no Metal equivalent; the entry
 // points emulate them with an index-buffer rewrite that reaches the
@@ -202,7 +202,7 @@ to_mtl_prim_type(D3DPRIMITIVETYPE pt) {
   }
 }
 
-// PrimitiveCount → vertex count (MGL/wined3d use the same arithmetic).
+// PrimitiveCount -> vertex count (MGL/wined3d use the same arithmetic).
 // MaxPrimitiveCount is advertised via D3DCAPS9 only; neither wined3d
 // (device.c d3d9_device_DrawPrimitive) nor DXVK (d3d9_device.cpp
 // D3D9DeviceEx::DrawPrimitive) rejects a draw whose PrimitiveCount
@@ -277,7 +277,7 @@ constexpr D3DRENDERSTATETYPE kColorWriteEnableRS[D3D_MAX_SIMULTANEOUS_RENDERTARG
     D3DRS_COLORWRITEENABLE3,
 };
 
-// D3DMULTISAMPLE_TYPE (+ quality) → Metal sampleCount + create-path
+// D3DMULTISAMPLE_TYPE (+ quality) -> Metal sampleCount + create-path
 // accept/reject HRESULT, for CreateRenderTarget / CreateDepthStencilSurface.
 // The create path validates the way wined3d texture.c does: every invalid or
 // device-unsupported request is D3DERR_INVALIDCALL. NOTAVAILABLE is a
@@ -886,7 +886,7 @@ MTLD3D9Device::~MTLD3D9Device() {
     // cmdbuf; waiting for (m_currentCmdSeq - 1) covers the most recent
     // commit and is a no-op if the GPU has already caught up.
     if (m_currentCmdSeq > 1)
-      m_completionEvent.waitUntilSignaledValue(m_currentCmdSeq - 1, UINT64_MAX);
+      waitForGpuOrDeviceError(m_currentCmdSeq - 1);
     // Drain the FIFO under a known-quiescent GPU so all blocks land in
     // the "adhoc or expired" recycle branch and dispose cleanly.
     m_constRing.free_blocks(static_cast<uint64_t>(-1));
@@ -1020,6 +1020,9 @@ MTLD3D9Device::commitCurrentChunkTimed() {
   m_constRing.seal_latest();
   m_uploadRing.seal_latest();
   m_dxmtQueue->CommitCurrentChunk();
+  // The allocations renamed into this command buffer become recyclable once it
+  // retires, so the pressure this counter tracks is now the next one's to carry.
+  m_renamedBytesSinceCommit = 0;
 }
 
 // Sampler cache lookup. Builds the prefix key from the input info,
@@ -1042,7 +1045,7 @@ MTLD3D9Device::getOrCreateSampler(const WMTSamplerInfo &info) {
 
 obj_handle_t
 MTLD3D9Device::dummyFragmentTexture(WMTTextureType type) {
-  // Opaque-black 1×1 placeholder for a sampled-but-unbound stage, pixel or
+  // Opaque-black 1x1 placeholder for a sampled-but-unbound stage, pixel or
   // vertex: the texture is ShaderRead, so the bind stage is the only
   // difference and the same dummies serve both. Typed per sampler kind because
   // a 2D bind on a 3D/cube sampler is a Metal type mismatch (wined3d keeps
@@ -1130,7 +1133,7 @@ MTLD3D9Device::drainPendingClear() {
   if (!m_pendingClear.color_valid && !m_pendingClear.depth_valid && !m_pendingClear.stencil_valid)
     return;
   // Route through ArgumentEncodingContext clear methods (not empty render pass).
-  // dxmt_context coalescer folds Clear→Render into next encoder's loadAction.
+  // dxmt_context coalescer folds Clear->Render into next encoder's loadAction.
   // Fires only when no queued draws AND clear must reach GPU before next sync.
   MTLD3D9Surface *ds = m_depthStencilSurface.ptr();
 
@@ -1583,6 +1586,18 @@ MTLD3D9Device::commitBufferUpload(
   QueueBlitOp(std::move(op));
 }
 
+bool
+MTLD3D9Device::waitForGpuOrDeviceError(uint64_t value) {
+  // Long enough that a healthy wait costs one wakeup, short enough that a dead
+  // command buffer is noticed rather than waited on.
+  constexpr uint64_t kSliceMilliseconds = 250;
+  while (!m_completionEvent.waitUntilSignaledValue(value, kSliceMilliseconds)) {
+    if (m_dxmtQueue && m_dxmtQueue->HasDeviceError())
+      return false;
+  }
+  return true;
+}
+
 void
 MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   // Local pool for the same reason as GetRenderTargetData: the commit
@@ -1653,7 +1668,8 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   uint64_t seq = m_dxmtQueue->CurrentSeqId();
   commitCurrentChunkTimed();
   m_dxmtQueue->WaitCPUFence(seq);
-  m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
+  if (!waitForGpuOrDeviceError(signal_seq))
+    return;
   std::memcpy(surface->cpuPtr(), static_cast<const char *>(span.host), total_bytes);
 }
 
@@ -2375,7 +2391,7 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     m_dxmtQueue->WaitCPUFence(seq);
   }
   if (m_currentCmdSeq > 1)
-    m_completionEvent.waitUntilSignaledValue(m_currentCmdSeq - 1, UINT64_MAX);
+    waitForGpuOrDeviceError(m_currentCmdSeq - 1);
 
   // Invalidate the COW snapshot: its ring block recycles with the old
   // chunks, and the next QueueBatchedDraw must rebuild from the freshly
@@ -2473,7 +2489,7 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   createAutoDepthStencil(m_presentParams);
 
   // 7. Re-bind the new backbuffer to RT0 (matches the ctor's auto-bind
-  //    shape: SetRenderTarget(0, …) also resets viewport/scissor to
+  //    shape: SetRenderTarget(0, ...) also resets viewport/scissor to
   //    the new RT extents, which is what apps expect post-Reset).
   // A D3D9Ex device preserves the app's viewport Z range (MinZ/MaxZ)
   // across Reset, unlike a non-Ex device which resets it to 0..1;
@@ -2706,9 +2722,8 @@ MTLD3D9Device::CreateTexture(
     return D3DERR_INVALIDCALL;
   *ppTexture = nullptr;
   // Pure pool/usage/dims/levels/depth-placement rejection matrix, shared with
-  // CreateCubeTexture / CreateVolumeTexture and host-pinned in
-  // test_create_validation.cpp. Carries the C1-O2 depth-format-outside-DEFAULT
-  // reject. The format-lowering rejects (unsupported format, RT capability) and
+  // CreateCubeTexture / CreateVolumeTexture. Carries the
+  // depth-format-outside-DEFAULT reject. The format-lowering rejects (unsupported format, RT capability) and
   // the shared-handle policy stay below.
   if (HRESULT hr = validate_texture_create(
           {D3D9TextureCreateKind::Texture2D, Format, Pool, Usage, Width, Height, 1, Levels, m_isEx}
@@ -2745,7 +2760,7 @@ MTLD3D9Device::CreateTexture(
       // Ex + DEFAULT + handle: a cross-process share request. Real sharing is
       // unimplemented; wined3d (PRIMARY) FIXMEs and proceeds without sharing,
       // never writing the out-handle, and the RT/DS creates already take that
-      // stance, so match it here rather than fail (C1-O3). An in-process-only
+      // stance, so match it here rather than fail. An in-process-only
       // use of the "shared" texture still works; a genuine cross-process
       // dependency degrades the same way it does on wine.
       Logger::warn("d3d9: CreateTexture: cross-process shared handle ignored (created unshared)");
@@ -2841,7 +2856,7 @@ MTLD3D9Device::CreateTexture(
     return D3D_OK;
   }
 
-  // Pool → storage (like CreateOffscreenPlainSurface + usage flags).
+  // Pool -> storage (like CreateOffscreenPlainSurface + usage flags).
   // RT-promotion: every DEFAULT color texture gets RenderTarget unconditionally.
   WMTResourceOptions storage;
   WMTTextureUsage usage_bits = WMTTextureUsageShaderRead;
@@ -2970,7 +2985,7 @@ MTLD3D9Device::CreateVolumeTexture(
     // defined for single-subresource 2D resources, so a volume texture with a
     // non-DEFAULT-pool handle is INVALIDCALL. A DEFAULT-pool handle is a
     // cross-process share request; real sharing is unimplemented, so proceed
-    // unshared like the 2D path and wined3d do (C1-O3).
+    // unshared like the 2D path and wined3d do.
     if (!m_isEx)
       return E_NOTIMPL;
     if (Pool != D3DPOOL_DEFAULT)
@@ -2979,8 +2994,7 @@ MTLD3D9Device::CreateVolumeTexture(
     pSharedHandle = nullptr;
   }
   // Pure pool/usage/dims/levels/format-class rejection matrix, shared with
-  // CreateTexture / CreateCubeTexture and host-pinned in
-  // test_create_validation.cpp. Depth, block-compressed and packed-YUV volume
+  // CreateTexture / CreateCubeTexture. Depth, block-compressed and packed-YUV volume
   // formats are gated here (IsVolumeTextureFormat + the SCRATCH-blob carve-out).
   if (HRESULT hr = validate_texture_create(
           {D3D9TextureCreateKind::Volume, Format, Pool, Usage, Width, Height, Depth, Levels, m_isEx}
@@ -3071,7 +3085,7 @@ MTLD3D9Device::CreateVolumeTexture(
 }
 
 // CreateCubeTexture: same validation as CreateTexture, one dimension (EdgeLength).
-// Allocates 6 faces × N levels sharing one TextureCube handle.
+// Allocates 6 faces x N levels sharing one TextureCube handle.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateCubeTexture(
     UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9 **ppCubeTexture,
@@ -3085,8 +3099,7 @@ MTLD3D9Device::CreateCubeTexture(
     return D3DERR_INVALIDCALL;
   *ppCubeTexture = nullptr;
   // Pure pool/usage/dims/levels/format-class rejection matrix, shared with
-  // CreateTexture / CreateVolumeTexture and host-pinned in
-  // test_create_validation.cpp. Carries the C1-O1 depth-format-cube reject
+  // CreateTexture / CreateVolumeTexture. Carries the depth-format-cube reject
   // (any pool/usage). The format-lowering rejects (unsupported format, RT
   // capability) and the shared-handle policy stay below.
   if (HRESULT hr = validate_texture_create(
@@ -3108,7 +3121,7 @@ MTLD3D9Device::CreateCubeTexture(
     // defined for single-subresource 2D resources, so a cube texture (six
     // faces) with a non-DEFAULT-pool handle is INVALIDCALL. A DEFAULT-pool
     // handle is a cross-process share request; real sharing is unimplemented,
-    // so proceed unshared like the 2D path and wined3d do (C1-O3).
+    // so proceed unshared like the 2D path and wined3d do.
     if (!m_isEx)
       return E_NOTIMPL;
     if (Pool != D3DPOOL_DEFAULT)
@@ -3119,7 +3132,7 @@ MTLD3D9Device::CreateCubeTexture(
 
   // Attachment usage on a format Metal cannot attach is rejected at create;
   // see CreateTexture. Depth-stencil formats were already rejected on a cube by
-  // validate_texture_create (C1-O1): no native driver backs a depth cube,
+  // validate_texture_create: no native driver backs a depth cube,
   // allowing it trips a broken path in Gothic 3 (DXVK), and CheckDeviceFormat
   // denies CUBETEXTURE + DEPTHSTENCIL, so create and probe agree.
   D3D9FormatUsage formatUsage = D3D9FormatUsage::SampleableTexture;
@@ -3232,7 +3245,7 @@ MTLD3D9Device::CreateCubeTexture(
   // Wrap in dxmt::Texture so chunk lambdas can capture a Rc<>. Cube
   // textures take only the regular ctor; MTLBuffer.newTexture rejects
   // non-Type2D so the buffer-backed shape doesn't apply here.
-  // Pool → flags mirrors CreateTexture above.
+  // Pool -> flags mirrors CreateTexture above.
   Rc<dxmt::Texture> dxmt_texture = new dxmt::Texture(info, m_metalDevice);
   dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
   if (Pool == D3DPOOL_DEFAULT)
@@ -3295,7 +3308,7 @@ MTLD3D9Device::CreateVertexBuffer(
   // contract, unlike the texture paths), ahead of everything below. An Ex +
   // DEFAULT handle is a cross-process share request; real sharing is
   // unimplemented, so proceed unshared like the texture creates and wined3d do
-  // (C1-O3) rather than fail the create.
+  // rather than fail the create.
   if (pSharedHandle) {
     if (!m_isEx)
       return E_NOTIMPL;
@@ -3327,7 +3340,7 @@ MTLD3D9Device::CreateVertexBuffer(
   // WRITEONLY is buffer-only and is the *expected* flag for vertex
   // buffers; allow it.
 
-  // Pool → Metal storage. Every D3D9 vertex buffer is Lockable per the
+  // Pool -> Metal storage. Every D3D9 vertex buffer is Lockable per the
   // API contract (the WRITEONLY flag is a hint, not a gate), so the
   // backing has to be CPU-mappable. Shared collapses to the same
   // physical pages as Private on Apple-Silicon UMA; Private would
@@ -3375,7 +3388,7 @@ MTLD3D9Device::CreateIndexBuffer(
   // NOTAVAILABLE for a non-DEFAULT pool on an Ex device, ahead of the index
   // format check below. An Ex + DEFAULT handle is a cross-process share
   // request; real sharing is unimplemented, so proceed unshared like the
-  // texture creates and wined3d do (C1-O3) rather than fail the create.
+  // texture creates and wined3d do rather than fail the create.
   if (pSharedHandle) {
     if (!m_isEx)
       return E_NOTIMPL;
@@ -3404,7 +3417,7 @@ MTLD3D9Device::CreateIndexBuffer(
   if (Pool == D3DPOOL_MANAGED && (Usage & D3DUSAGE_DYNAMIC))
     return D3DERR_INVALIDCALL;
 
-  // Pool → Metal storage (mirrors CreateVertexBuffer; see that body
+  // Pool -> Metal storage (mirrors CreateVertexBuffer; see that body
   // for the rationale on always going Shared on UMA).
   switch (Pool) {
   case D3DPOOL_DEFAULT:
@@ -3458,7 +3471,7 @@ MTLD3D9Device::CreateRenderTarget(
   // still needs a placeholder Metal texture so the rest of the dxmt
   // surface plumbing (refcount, GetRenderTarget round-trips, swizzle
   // math) doesn't have to special-case a null storage. Allocate a
-  // 1×1 BGRA8 dummy and rely on the batched-draw render-pass open +
+  // 1x1 BGRA8 dummy and rely on the batched-draw render-pass open +
   // bindPSOAndDraw to skip the slot whenever the surface's D3DFORMAT is NULL.
   // Reference: DXVK src/d3d9/d3d9_common_texture.cpp.
   const bool isNullRT = IsNullFormat(Format);
@@ -3494,7 +3507,7 @@ MTLD3D9Device::CreateRenderTarget(
   // RT shape so SetTexture binds the same handle.
   WMTTextureInfo info{};
   info.pixel_format = pixelFormat;
-  // NULL-RT placeholder: 1×1, single sample, plain RT usage. The
+  // NULL-RT placeholder: 1x1, single sample, plain RT usage. The
   // Width/Height the app asked for stay on the D3DSURFACE_DESC so
   // queries round-trip, but no Metal storage proportional to the
   // real RT size gets allocated.
@@ -3640,8 +3653,7 @@ MTLD3D9Device::CreateDepthStencilSurface(
       WMTTextureUsageRenderTarget | (sampleCount > 1 ? WMTTextureUsageShaderRead : 0)
   );
   info.options = WMTResourceStorageModePrivate;
-  // Discard is ignored for the storage choice (always Private, above). C1-O4
-  // oracle-debt: DXVK additionally REJECTS Discard=TRUE on a lockable-depth
+  // Discard is ignored for the storage choice (always Private, above). DXVK additionally REJECTS Discard=TRUE on a lockable-depth
   // format (D32/D32F/D16/S8_LOCKABLE) with INVALIDCALL, but wined3d (PRIMARY)
   // does no such validation and the adjacent MSAA+lockable-depth cell is left
   // wine-permissive too, so adding a DXVK-only reject here without a native
@@ -3712,7 +3724,7 @@ MTLD3D9Device::CreateDepthStencilSurface(
   *ppSurface = surface;
   return D3D_OK;
 }
-// UpdateSurface: SYSTEMMEM → DEFAULT blit. Symmetric inverse of
+// UpdateSurface: SYSTEMMEM -> DEFAULT blit. Symmetric inverse of
 // GetRenderTargetData. Validation per DXVK d3d9_device.cpp.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::UpdateSurface(
@@ -3875,7 +3887,7 @@ MTLD3D9Device::UpdateSurface(
   // nothing to copy if it somehow has none.
   return D3D_OK;
 }
-// UpdateTexture: SYSTEMMEM master → DEFAULT mirror (push to GPU).
+// UpdateTexture: SYSTEMMEM master -> DEFAULT mirror (push to GPU).
 // Validation: same type/format/level-0 dims, src_levels >= dst_levels.
 // MANAGED resources push their own contents per-Unlock and are not a valid
 // source or destination here (wined3d rejects them).
@@ -4087,8 +4099,8 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
         continue;
       // Byte offset into the mirror for the dirty sub-rect: the level
       // starts at mirrorOffset(src_level); within the level, the rect
-      // origin shifts by t rows × pitch + l columns × bpp (compressed:
-      // block-row pitch × block-row + block-column bytes).
+      // origin shifts by t rows x pitch + l columns x bpp (compressed:
+      // block-row pitch x block-row + block-column bytes).
       uint64_t row_off, col_off;
       if (compressed) {
         // DXT1: 8 bytes/block. DXT2-5: 16 bytes/block. Same switch as
@@ -4286,7 +4298,7 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       uint32_t src_pitch = D3DFormatLockPitch(src->d3dFormat(), d.Width);
       if (src_pitch == 0 || bpp == 0)
         continue;
-      // 3D mirror layout: level base + slice_pitch×Front + row_pitch×Top + bpp×Left.
+      // 3D mirror layout: level base + slice_pitch * Front + row_pitch * Top + bpp * Left.
       uint32_t slice_pitch = src_pitch * d.Height;
       const uint8_t *src_ptr = src_base + src->mirrorOffset(src_level) + static_cast<size_t>(f) * slice_pitch +
                                static_cast<size_t>(t) * src_pitch + static_cast<size_t>(l) * bpp;
@@ -4320,7 +4332,7 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     return D3D_OK;
   }
 
-  // Cube branch: same shape, per face × level. Cube mirror is a
+  // Cube branch: same shape, per face x level. Cube mirror is a
   // plain std::vector<uint8_t> (no Metal buffer), so the upload routes
   // through stageTextureUpload (CPU pointer + staging-ring memcpy)
   // rather than the buffer-direct path.
@@ -4509,7 +4521,7 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     return D3D_OK;
   }
 }
-// GetRenderTargetData: RT → SYSTEMMEM blit. Validation per DXVK
+// GetRenderTargetData: RT -> SYSTEMMEM blit. Validation per DXVK
 // d3d9_device.cpp, which forwards a DEFAULT-pool destination to StretchRect.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSurface9 *pDestSurface) {
@@ -4605,7 +4617,8 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
     uint64_t seq = m_dxmtQueue->CurrentSeqId();
     commitCurrentChunkTimed();
     m_dxmtQueue->WaitCPUFence(seq);
-    m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
+    if (!waitForGpuOrDeviceError(signal_seq))
+      return D3DERR_DEVICELOST;
     return D3D_OK;
   }
 
@@ -4675,7 +4688,8 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
   uint64_t seq = m_dxmtQueue->CurrentSeqId();
   commitCurrentChunkTimed();
   m_dxmtQueue->WaitCPUFence(seq);
-  m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
+  if (!waitForGpuOrDeviceError(signal_seq))
+    return D3DERR_DEVICELOST;
 
   // The ring block is laid out at the mirror's row pitch, so the copy out
   // is one contiguous span.
@@ -4688,7 +4702,7 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
   dst->flagContainerDirtyRegion(nullptr);
   return D3D_OK;
 }
-// GetFrontBufferData: synchronous backbuffer → SYSTEMMEM readback.
+// GetFrontBufferData: synchronous backbuffer -> SYSTEMMEM readback.
 // DXVK d3d9_swapchain.cpp GetFrontBufferData is the model: mismatched
 // extents copy the intersection, a non-A8R8G8B8 display-format source is
 // converted to the spec's A8R8G8B8 destination per pixel,
@@ -4766,7 +4780,7 @@ MTLD3D9Device::frontBufferReadback(MTLD3D9SwapChain *chain, IDirect3DSurface9 *p
 
   const uint32_t src_w = sd.Width;
   const uint32_t src_h = sd.Height;
-  // Equal formats share a texel size by construction; the X8 → A8 pair
+  // Equal formats share a texel size by construction; the X8 -> A8 pair
   // is 4 bytes on both sides.
   const uint32_t bpp = D3DFormatBytesPerPixel(sd.Format);
   if (bpp == 0)
@@ -4827,7 +4841,8 @@ MTLD3D9Device::frontBufferReadback(MTLD3D9SwapChain *chain, IDirect3DSurface9 *p
   uint64_t seq = m_dxmtQueue->CurrentSeqId();
   commitCurrentChunkTimed();
   m_dxmtQueue->WaitCPUFence(seq);
-  m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
+  if (!waitForGpuOrDeviceError(signal_seq))
+    return D3DERR_DEVICELOST;
 
   // Windowed mode places the copy at the window's client-area origin
   // in screen coordinates (DXVK queries ClientToScreen the same way).
@@ -4893,7 +4908,7 @@ MTLD3D9Device::frontBufferReadback(MTLD3D9SwapChain *chain, IDirect3DSurface9 *p
   dst->flagContainerDirtyRegion(nullptr);
   return D3D_OK;
 }
-// StretchRect: DEFAULT→DEFAULT surface blit. Validation per DXVK
+// StretchRect: DEFAULT->DEFAULT surface blit. Validation per DXVK
 // d3d9_device.cpp. MVP path: same-format, same-extent, no MSAA,
 // no depth-stencil. Stretch / format-convert / resolve / DS land in
 // follow-ups (each routes through a different Metal path: render-pass
@@ -4934,7 +4949,7 @@ MTLD3D9Device::stretchRectImpl(
   // A mapped participant is INVALIDCALL: wined3d texture.c wined3d_texture_blt
   // returns WINEDDERR_SURFACEBUSY (d3d9 remaps to INVALIDCALL) for a locked
   // source or destination. The same locked() gate UpdateSurface applies (both
-  // are GPU copies that must not straddle an outstanding CPU map). (D3-O7)
+  // are GPU copies that must not straddle an outstanding CPU map).
   if (src->locked() || dst->locked())
     return D3DERR_INVALIDCALL;
   const D3DSURFACE_DESC &sd = src->desc();
@@ -4963,14 +4978,14 @@ MTLD3D9Device::stretchRectImpl(
       dxmt::plan_stretch_rect(plan_src, plan_dst, pSourceRect, pDestRect, Filter, m_inScene, from_readback);
   if (FAILED(plan.hr)) {
     // Leave a breadcrumb for the two multisampled depth-stencil deferrals
-    // (D3-O9): the source needs a depth-resolve encoder (Metal depth attachment
+    //: the source needs a depth-resolve encoder (Metal depth attachment
     // resolve), the destination needs the resolved-location scheme wined3d
     // tracks per subresource, so a title that trips either is diagnosable
     // instead of getting a silent INVALIDCALL. Both read the lowered sample
     // count the planner decided on, since D3DMULTISAMPLE_NONMASKABLE at quality
     // 0 lowers to a single sample and would otherwise misattribute an unrelated
     // rejection. (Single-sample -> multisample colour is handled via the Stretch
-    // broadcast path, D3-O2, so it no longer rejects here.)
+    // broadcast path, so this rejection does not apply to it.)
     if (IsDepthStencilFormat(sd.Format)) {
       if (plan_src.sample_count > 1)
         Logger::warn("d3d9: StretchRect: multisampled depth-stencil resolve is not implemented; rejecting");
@@ -4983,7 +4998,7 @@ MTLD3D9Device::stretchRectImpl(
   // The render-pass Stretch (and the stretch leg of a resolve-then-stretch)
   // samples the source through its D3D9 channel swizzle so a format-converting
   // stretch from a fixup-needing source (L8, A4R4G4B4, V8U8, ATI2, 2-channel, or
-  // the X->A alpha fix of D3-O6) reads the shape D3D9 promises rather than raw
+  // the X->A alpha fix) reads the shape D3D9 promises rather than raw
   // storage channels, the same fixup the sample-bind path applies. Copy and
   // Resolve ignore it; {Zero,Zero,Zero,Zero} is the identity sentinel.
   WMTTextureSwizzleChannels src_swizzle = {
@@ -5050,7 +5065,7 @@ MTLD3D9Device::stretchRectImpl(
     break;
   }
   case dxmt::StretchRectKind::ResolveThenStretch: {
-    // Scaled / fixup-source MSAA resolve (D3-O1): resolve the source into a
+    // Scaled / fixup-source MSAA resolve: resolve the source into a
     // single-sample transient at the source-rect extent (1:1, no scale, no
     // convert), then Stretch that transient into the real destination so the
     // scale, the format convert, and the source channel fixup are all honoured.
@@ -5393,7 +5408,7 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
   // backs the create with a host mirror alone, the same texture-less shape as
   // a packed-YUV SCRATCH surface. MANAGED was already rejected above, matching
   // the wined3d offscreen-plain pool rules.
-  // DOC-DIV (C2-O9, refs split): dxmt accepts EVERY depth format here, matching
+  // Deliberate divergence: dxmt accepts EVERY depth format here, matching
   // wined3d (its blit-cap surface path, directx.c). DXVK restricts plain
   // surfaces to the LOCKABLE depth formats only (adapter.cpp, a native-derived
   // rule). dxmt sits on the wined3d-primary side; a wine-test oracle covering
@@ -5479,7 +5494,7 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
   if (pixelFormat == WMTPixelFormatInvalid)
     return D3DERR_INVALIDCALL;
 
-  // Pool → Metal storage. D3DPOOL_DEFAULT lives GPU-side and is the
+  // Pool -> Metal storage. D3DPOOL_DEFAULT lives GPU-side and is the
   // legal StretchRect destination; SYSTEMMEM/SCRATCH live CPU-side and
   // are the legal UpdateSurface source. Apple Silicon's unified memory
   // makes Shared a zero-copy fit for the CPU pools.
@@ -5557,7 +5572,7 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
       return D3DERR_OUTOFVIDEOMEMORY;
     std::memset(ownedBacking, 0, mirror_bytes);
     cpuPtr = ownedBacking;
-    // buffer stays null → UnlockRect takes the mirror-upload path, not the
+    // buffer stays null -> UnlockRect takes the mirror-upload path, not the
     // zero-copy buffer-backed path SYSTEMMEM/SCRATCH use.
   } else if (user_memory) {
     // D3D9Ex user-memory: the app pointer is the lock storage, tightly
@@ -5685,11 +5700,11 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
 
   // If the bound surface for this slot is actually changing, drain any
   // pending clear onto the OLD RT before m_renderTargets mutates.
-  // without it a Clear → SetRT (no draws between) would land the clear
+  // without it a Clear -> SetRT (no draws between) would land the clear
   // on the new RT instead of the old, and the old RT would carry
   // forward stale content into subsequent frames. drainPendingClear
   // captures the current RT0/DS resources in its emitcc closure, so it
-  // remains RT-correct even though we no longer FlushDrawBatch here.
+  // remains RT-correct without a FlushDrawBatch here.
   // Queued draws resolve before the SetRef op below is applied, so
   // they still observe the pre-Set binding.
   bool surface_changed = m_renderTargets[RenderTargetIndex].ptr() != surface;
@@ -5875,12 +5890,12 @@ MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR C
   if (Count == 0 && pRects != nullptr)
     return D3D_OK;
   // Non-zero Count + NULL rects: both references normalize to full-target clear.
-  // Prior INVALIDCALL broke legal calls (dropped frame-clear → visual garbage).
+  // Prior INVALIDCALL broke legal calls (dropped frame-clear -> visual garbage).
   if (Count != 0 && pRects == nullptr)
     Count = 0;
 
   MTLD3D9Surface *ds = m_depthStencilSurface.ptr();
-  // No DS bound + Z/Stencil flag → INVALIDCALL (DXVK).
+  // No DS bound + Z/Stencil flag -> INVALIDCALL (DXVK).
   if (!ds && (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)))
     return D3DERR_INVALIDCALL;
   // wined3d device.c wined3d_device_clear: a combined TARGET +
@@ -6334,7 +6349,7 @@ MTLD3D9Device::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value) {
   if (m_renderStates[State] == Value)
     return D3D_OK;
   // SRGBWRITEENABLE flips the colour-attachment pixel format
-  // (linear ↔ sRGB-aliased view). The PSO and the render pass must
+  // (linear <-> sRGB-aliased view). The PSO and the render pass must
   // agree on attachment format; under the chunk path the per-batch
   // ResolveBatchedDrawForChunk reads D3DRS_SRGBWRITEENABLE at queue
   // time and StartRenderPassForBatch_d9 splits the render pass when
@@ -6343,7 +6358,7 @@ MTLD3D9Device::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value) {
   // a sibling render pass within the chunk.
   m_renderStates[State] = Value;
   // Invalidate the COW snapshot so the next QueueBatchedDraw captures
-  // the new value. POD setters no longer need to FlushDrawBatch; each
+  // the new value. POD setters do not need to FlushDrawBatch; each
   // pending BatchedDraw already references its own frozen pod_snapshot.
   m_encShadowDirty |= dxmt::D9ES_DIRTY_RENDER_STATES;
   return D3D_OK;
@@ -6508,9 +6523,9 @@ MTLD3D9Device::GetClipStatus(D3DCLIPSTATUS9 *pClipStatus) {
   *pClipStatus = m_clipStatus;
   return D3D_OK;
 }
-// Stage layout (wined3d pattern): PS 0..15 (slots 0..15), VS samplers 257..260→16..19.
-// Out-of-range: GetTexture→NULL/D3D_OK; SetTexture→silent no-op (DMAP without cap check).
-// GPU-side mapping at draw time (sampler slot N → m_textures[N]).
+// Stage layout (wined3d pattern): PS 0..15 (slots 0..15), VS samplers 257..260->16..19.
+// Out-of-range: GetTexture->NULL/D3D_OK; SetTexture->silent no-op (DMAP without cap check).
+// GPU-side mapping at draw time (sampler slot N -> m_textures[N]).
 namespace {
 // Returns 0..19 for a valid stage, or UINT32_MAX for stages that the
 // runtime ignores (D3DDMAPSAMPLER and out-of-range values).
@@ -6665,7 +6680,7 @@ MTLD3D9Device::GetTextureStageState(DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, 
   return D3D_OK;
 }
 // One of hottest entry points: pure DWORD store/load.
-// Stage layout matches SetTexture: PS 0..15, VS 257..260→16..19, out-of-range→no-op.
+// Stage layout matches SetTexture: PS 0..15, VS 257..260->16..19, out-of-range->no-op.
 // D3DSAMP_INVALID slot (index 0) accepted; indices >14 out-of-enum rejected.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::GetSamplerState(DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD *pValue) {
@@ -6899,7 +6914,7 @@ MTLD3D9Device::swvpDrawGateRejects() {
   return true;
 }
 
-// All entry points (DP/DIP/DPUP/DIPUP) queue: BuildDrawCapture→QueueBatchedDraw.
+// All entry points (DP/DIP/DPUP/DIPUP) queue: BuildDrawCapture->QueueBatchedDraw.
 // Encode-side: ResolveBatchedDrawForChunk + EmitCommonRenderSetup_d9 + EmitDrawCommand_d9.
 // Per-(RT,DS) encoder batching avoids tile-store/load; BatchedDraw POD-COW is DXVK m_dirty analogue.
 HRESULT STDMETHODCALLTYPE
@@ -7387,6 +7402,13 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
   // points at the slot we're about to occupy in m_pendingDraws.
   m_pendingOps.push_back({PendingOpRef::Draw, static_cast<uint32_t>(m_pendingDraws.size())});
   m_pendingDraws.push_back(std::move(draw));
+  // Submit once the renamed allocations this command buffer pins outgrow the
+  // threshold. A draw is the boundary to do it on: the recording is complete,
+  // and unlike Lock no application-held pointer is outstanding. See
+  // kRenameBytesBeforeImplicitCommit for why an unsubmitted scene is the case
+  // that needs this.
+  if (m_renamedBytesSinceCommit >= kRenameBytesBeforeImplicitCommit)
+    forceFlushAndCommit();
   // Per-frame draw rate. All four Draw* entry points funnel through
   // here (DrawPrimitive / DrawIndexedPrimitive and the UP siblings),
   // so a single bump here covers the full draw stream.
@@ -7586,7 +7608,7 @@ StartRenderPassForBatch_d9(ArgumentEncodingContext &ctx, const MTLD3D9Device::Ba
     color.depth_plane = 0;
     // loadAction=Load is the right default; any pending Clear was
     // emitted as a standalone Clear chunk by drainPendingClear, and
-    // the coalescer's Clear→Render fold (dxmt_context.cpp)
+    // the coalescer's Clear->Render fold (dxmt_context.cpp)
     // will upgrade this attachment's load_action to Clear and import
     // the Clear encoder's color when the targets match.
     color.load_action = WMTLoadActionLoad;
@@ -8086,12 +8108,12 @@ EmitStretchBlitOp_d9(StretchBlitContext &stretch_cmd, MTLD3D9Device::PendingBlit
       .miplevelCount = 1,
       .firstArraySlice = static_cast<uint32_t>(op.src_slice),
       .arraySize = 1,
-      // Per-format channel fixup for a converting stretch (C2-O12); identity for
+      // Per-format channel fixup for a converting stretch; identity for
       // same-shape sources. Set on the calling thread from D3DFormatSamplerSwizzle.
       .swizzle = op.src_swizzle,
   });
   // The destination is the one side whose sample count varies: the single-sample
-  // to multisample broadcast (D3-O2) renders into a multisampled target, and
+  // to multisample broadcast renders into a multisampled target, and
   // Metal rejects a plain 2D view over one.
   TextureViewKey dst_view = op.dst_tex->createView({
       .format = op.dst_tex->pixelFormat(),
@@ -8339,9 +8361,8 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     for (uint32_t i = 0; i < 16; ++i)
       bd.resolved_frag_texture_dxmt[i] = resolve_cache.resolved_frag_texture_dxmt[i];
   } else {
-    // Pre-convert viewport / scissor to Metal shape now so per-draw emit
-    // doesn't re-run the helpers. The conversion used to live in
-    // BuildDrawCapture on the calling thread.
+    // Pre-convert viewport / scissor to Metal shape so per-draw emit does not
+    // re-run the helpers.
     bd.resolved_viewport = wmt_viewport_from_d3d9(pod.viewport);
     bd.resolved_scissor = wmt_scissor_from_d3d9(pod.scissor_rect, pod.viewport, rs[D3DRS_SCISSORTESTENABLE] != 0);
 
@@ -8665,7 +8686,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     }
     // Fetch (find-or-create + submit) the async vertex-function compile
     // task; the LLVM AIR emit runs on a pool thread, not here. A cold
-    // variant no longer stalls the encode thread; the PSO task below waits
+    // variant does not stall the encode thread; the PSO task below waits
     // on this task off-thread and the null-state skip drops a failed compile.
     D3D9CompiledFunction *vs_fn =
         ffp_vs ? ffpVertexFunction(
@@ -8810,7 +8831,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     // luminance scale/offset ride the shared PS uniform tail (written into
     // ps_b_blob below, unconditionally from the pod so the buffer stays a
     // pure function of the const-cache key) and the generated PS reads them
-    // at runtime. They no longer bake into the variant, so an app that
+    // at runtime. They do not bake into the variant, so an app that
     // animates bump-env keeps one variant per material instead of churning
     // a cold PSO link per frame. DXVK feeds the same constants through its
     // D3D9SharedPS uniform (src/d3d9/d3d9_state.h + dxso_compiler.cpp emitBem).
@@ -9693,7 +9714,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     bd.resolved_const_uploads = const_cache.uploads;
   } else {
     // Pack into ONE m_constRingResolve.allocate per draw; the ring is mutex-
-    // guarded, so 8 separate calls cost 8 lock/unlock cycles × 10k draws
+    // guarded, so 8 separate calls cost 8 lock/unlock cycles x 10k draws
     // = 80k mutex pairs on the encode thread per frame. Each sub-section
     // is 256-byte-aligned (Metal setBuffer offset alignment requirement
     // on this GPU family, Mac2), so the packed layout is mathematically
@@ -9776,7 +9797,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       // samplers (16..19) get no bias: extending it would need a parallel
       // vertex-side constant blob plus a bias add at the VS texldl site in
       // dxso_compile (Metal samplers cannot carry the bias, so the sampler-
-      // object route is closed). Deferred as A2-O4: it needs a mipmapped
+      // object route is closed). Not covered by a test: it needs a mipmapped
       // vertex texture sampled by a vs_3_0 shader with a non-zero bias, a
       // rare heightfield-LOD pattern, and DXVK/GL apply the bias to explicit-
       // lod VTF ops, so this is a low-severity gap not worth the uniform-
@@ -10667,7 +10688,7 @@ MTLD3D9Device::DrawIndexedPrimitiveUP(
     clear_up_state(VertexStreamZeroStride);
     return D3DERR_INVALIDCALL;
   }
-  // NumVertices==0 is spec-legal (degenerate draw → no-op), same as the
+  // NumVertices==0 is spec-legal (degenerate draw -> no-op), same as the
   // non-UP DrawIndexedPrimitive sibling. DXVK returns D3D_OK on
   // (!PrimitiveCount || !NumVertices); wined3d doesn't check at the
   // d3d9 layer. Apps passing 0 (rare but possible from procedural mesh
@@ -11086,7 +11107,7 @@ MTLD3D9Device::GetVertexDeclaration(IDirect3DVertexDeclaration9 **ppDecl) {
     *ppDecl = ::dxmt::ref<IDirect3DVertexDeclaration9>(bound);
   return D3D_OK;
 }
-// FVF → synthesized vertex declaration, cached per FVF dword. Shared
+// FVF -> synthesized vertex declaration, cached per FVF dword. Shared
 // by SetFVF's live and recording arms so the recording path can pin
 // the decl a recorded SetFVF implies without touching the live slot.
 MTLD3D9VertexDeclaration *
@@ -11867,7 +11888,6 @@ MTLD3D9Device::CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9 **ppQuery) {
   // ppQuery=NULL is a support probe. The out pointer is written only on
   // success: an unsupported type returns NOTAVAILABLE and leaves the caller's
   // pointer untouched (it is not a sentinel), matching d3d9_device_CreateQuery.
-  // The support matrix is host-pinned in test_query.cpp.
   if (!d3d9_query_supported(Type))
     return D3DERR_NOTAVAILABLE;
   if (!ppQuery)

@@ -30,6 +30,10 @@ discardRenameDynamicBuffer(MTLD3D9Device *device, DynamicBuffer *dynamic, uint64
       device->frameStats(), minted_fresh ? &dxmt::FrameStatistics::frame_dynamic_rename_fresh_count
                                          : &dxmt::FrameStatistics::frame_dynamic_rename_recycled_count
   );
+  // Only a mint adds to the footprint the next commit has to relieve; a recycle
+  // reuses memory already accounted for.
+  if (minted_fresh)
+    device->noteDynamicRenameBytes(fresh->length());
   dynamic->updateImmediateName(current_seq, std::move(fresh), 0, false);
   return D3D_OK;
 }
@@ -108,7 +112,9 @@ MTLD3D9VertexBuffer::refreshWholeMirror() {
   m_device->commitBufferUpload(reservation, m_dynamic->immediateName(), 0, m_hostPtr, m_size);
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_bytes, m_size);
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_count, 1);
-  m_dirty = false;
+  // Still mapped means the application can write more before the next draw
+  // without telling us, so the cache cannot be declared current yet.
+  m_dirty = m_writeLocked;
 }
 
 void
@@ -136,7 +142,7 @@ MTLD3D9VertexBuffer::Release() {
     return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
-    // Losable counter: decrement on pub→0, BEFORE m_device->Release
+    // Losable counter: decrement on pub->0, BEFORE m_device->Release
     // can destruct the device. See MTLD3D9Surface::Release for the
     // full rationale: Reset's counter check fires while bound
     // resources still have device priv refs, so the counter must
@@ -276,8 +282,10 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
   // A write lock stales the cache and nothing finer is recorded: the
   // application does not truthfully report which bytes it wrote, and may still
   // be writing after Unlock (d3d9_buffer_map.hpp).
-  if (buffer_lock_updates_dirty(Flags))
+  if (buffer_lock_updates_dirty(Flags)) {
     m_dirty = true;
+    m_writeLocked = true;
+  }
   m_lockCount.increment();
   *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
   return D3D_OK;
@@ -290,7 +298,8 @@ MTLD3D9VertexBuffer::Unlock() {
   // refreshes it, because an application may still be writing through the
   // pointer it was handed: a lock is advisory about its extent and about its
   // lifetime both, so anything finalised at Unlock can already be stale.
-  m_lockCount.decrement();
+  if (m_lockCount.decrement() == 0)
+    m_writeLocked = false;
   return D3D_OK;
 }
 
@@ -368,7 +377,9 @@ MTLD3D9IndexBuffer::refreshWholeMirror() {
   m_device->commitBufferUpload(reservation, m_dynamic->immediateName(), 0, m_hostPtr, m_size);
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_bytes, m_size);
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_count, 1);
-  m_dirty = false;
+  // Still mapped means the application can write more before the next draw
+  // without telling us, so the cache cannot be declared current yet.
+  m_dirty = m_writeLocked;
 }
 
 void
@@ -510,8 +521,10 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
   // A write lock stales the cache and nothing finer is recorded: the
   // application does not truthfully report which bytes it wrote, and may still
   // be writing after Unlock (d3d9_buffer_map.hpp).
-  if (buffer_lock_updates_dirty(Flags))
+  if (buffer_lock_updates_dirty(Flags)) {
     m_dirty = true;
+    m_writeLocked = true;
+  }
   m_lockCount.increment();
   *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
   return D3D_OK;
@@ -521,7 +534,8 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9IndexBuffer::Unlock() {
   D9DeviceLock lock = m_device->LockDevice();
   // See MTLD3D9VertexBuffer::Unlock: the draw refreshes, not this.
-  m_lockCount.decrement();
+  if (m_lockCount.decrement() == 0)
+    m_writeLocked = false;
   return D3D_OK;
 }
 

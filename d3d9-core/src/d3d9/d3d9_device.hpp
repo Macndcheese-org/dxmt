@@ -70,7 +70,7 @@ template <> struct task_trait<D3D9AsyncTask *> {
 };
 
 // 16 fragment samplers (PS 0..15) + 4 vertex samplers
-// (D3DVERTEXTEXTURESAMPLER0..3) → 20 internal slots. Mirrors wined3d's
+// (D3DVERTEXTEXTURESAMPLER0..3) -> 20 internal slots. Mirrors wined3d's
 // D3D9_MAX_TEXTURE_UNITS in dlls/d3d9/d3d9_private.h.
 inline constexpr unsigned D3D9_MAX_TEXTURE_UNITS = 20;
 
@@ -259,6 +259,37 @@ public:
   // path, emits the tail signal, and commits. Pulled out of the
   // vertex/index buffer Lock helpers so both share one shape.
   void forceFlushAndCommit();
+
+  // Bytes of dynamic-buffer allocations minted since the last commit, and the
+  // point at which the next draw submits rather than accumulating further.
+  //
+  // A recycled allocation costs nothing, but a MINTED one is memory the GPU
+  // holds until the command buffer referencing it retires, and nothing retires
+  // without a commit. An application that renders a whole scene between
+  // Presents therefore grows the working set without bound: Lock(DISCARD) in a
+  // loop mints a fresh allocation every iteration, and Metal eventually fails
+  // the command buffer with an out-of-memory error. Committing on a byte
+  // threshold gives the recycler retired generations to hand back, which is the
+  // same reason wined3d and DXVK submit implicitly rather than only at Present.
+  //
+  // D3D9 promises nothing about when work is submitted, so an extra command
+  // buffer is always legal. The threshold trades command-buffer count against
+  // peak footprint, and it is far above what an ordinary frame renames, so a
+  // title that Presents normally never reaches it and pays nothing.
+  //
+  // Measured, not guessed: a scene renaming without Present fails its draws at
+  // 64 MiB (the command buffer reports out of memory and the work it carried is
+  // lost, which reads downstream as a render target that never got painted) and
+  // is clean at 16 MiB across repeated runs. The gap between the two is the
+  // margin the rest of the process needs, so this sits well below the point
+  // where the allocation actually fails rather than at it.
+  static constexpr uint64_t kRenameBytesBeforeImplicitCommit = 16ull << 20;
+  uint64_t m_renamedBytesSinceCommit = 0;
+
+  void
+  noteDynamicRenameBytes(uint64_t bytes) {
+    m_renamedBytesSinceCommit += bytes;
+  }
 
   HRESULT STDMETHODCALLTYPE TestCooperativeLevel() override;
   UINT STDMETHODCALLTYPE GetAvailableTextureMem() override;
@@ -649,7 +680,7 @@ public:
     // Points into the queue's command-data ring; valid until the owning
     // chunk retires, which outlives every Resolve read of it.
     const dxmt::D9EncodingState *pod_snapshot = nullptr;
-    // Ref-counted state is no longer per-draw; the chunk walker
+    // Ref-counted state is not per-draw; the chunk walker
     // mutates the persistent device-side D9EncodingRefs mirror
     // (MTLD3D9Device::m_encodeSideRefs) by replaying the SetRef ops in
     // arrival order. Resolve reads from that mirror; arrival-order on
@@ -805,7 +836,7 @@ public:
     // wmt_*_from_d3d9 helpers in every per-draw emit pass.
     WMTViewport resolved_viewport = {};
     WMTScissorRect resolved_scissor = {};
-    // Pending-clear no longer rides on the BatchedDraw; it's emitted as
+    // Pending-clear does not ride on the BatchedDraw; it's emitted as
     // a standalone Clear chunk by flushOpenWork's drainPendingClear and
     // folded into the first surviving Render encoder by the dxmt_context
     // coalescer (dxmt_context.cpp). The standalone chunk also keeps the
@@ -1002,7 +1033,7 @@ private:
   // so a pure hardware-VP device never enters this path.
   bool swvpDrawGateRejects();
   // Allocate a throwaway single-sample Private render target for the
-  // resolve-then-stretch StretchRect compose (D3-O1): a scaled or fixup-source
+  // resolve-then-stretch StretchRect compose: a scaled or fixup-source
   // MSAA resolve first resolves into this transient at the source extent, then
   // the Stretch reads it. RenderTarget|ShaderRead|PixelFormatView usage so it
   // serves as the resolve destination and the swizzled Stretch source. Returns
@@ -1026,7 +1057,7 @@ private:
   // the pre-built capacity, otherwise 0 (caller falls back to the
   // per-call m_constRing alloc). Lazily allocates on first call.
   obj_handle_t fanListIBForPrimCount(uint32_t prim_count);
-  // Resolve a fan→list u32 IB for the four Draw* fan emulation sites.
+  // Resolve a fan->list u32 IB for the four Draw* fan emulation sites.
   // When `src == nullptr` (synthesise 0..N-1) tries the cached
   // fanListIBForPrimCount path first; otherwise allocates from
   // m_constRing and remaps from `src` (a u16/u32 source IB or inline
@@ -1256,8 +1287,8 @@ private:
   // keep whatever cursor is current.
   HCURSOR m_hwCursor = nullptr;
 #endif
-  // D3D9 device-state machine: Ok → S_OK, Lost → D3DERR_DEVICELOST
-  // (unreachable today), NotReset → D3DERR_DEVICENOTRESET. Ex devices
+  // D3D9 device-state machine: Ok -> S_OK, Lost -> D3DERR_DEVICELOST
+  // (unreachable today), NotReset -> D3DERR_DEVICENOTRESET. Ex devices
   // return S_OK; use CheckDeviceState instead.
   enum class DeviceState : uint8_t { Ok, Lost, NotReset };
   std::atomic<DeviceState> m_deviceState{DeviceState::Ok};
@@ -1361,7 +1392,7 @@ private:
   // whenever the running sum grows.
   size_t m_bufferBackingPoolPeak = 0;
   // Cap so a pathological create/destroy churn doesn't accumulate
-  // unbounded VRAM. 128 entries × typical D3D9 buffer/texture sizes
+  // unbounded VRAM. 128 entries x typical D3D9 buffer/texture sizes
   // caps worst-case pool memory in the low-hundreds-of-MB range on
   // Apple Silicon. Sized for level-transition bursts that create 100+
   // textures in one frame; at 64 the pool evicted entries before the
@@ -1639,12 +1670,12 @@ private:
 
   // High-water mark of SetVertexShaderConstantF/SetPixelShaderConstantF
   // coverage. Encode-side memcpy clamps to (max * 16) bytes instead of
-  // full register file (~16× reduction). Typical shaders set ~30 VS / ~20 PS.
+  // full register file (~16x reduction). Typical shaders set ~30 VS / ~20 PS.
   uint16_t m_vsConstFMax = 0;
   uint16_t m_psConstFMax = 0;
 
   // Viewport / scissor. Seeded in the ctor and reseeded on
-  // SetRenderTarget(0, …) per D3D9 spec.
+  // SetRenderTarget(0, ...) per D3D9 spec.
   D3DVIEWPORT9 m_viewport = {};
   RECT m_scissorRect = {};
 
@@ -1846,7 +1877,7 @@ private:
   // the descriptor, which the draw path treats as "skip the bind".
   Rc<Sampler> getOrCreateSampler(const WMTSamplerInfo &info);
 
-  // 1×1 placeholder bound to unbound fragment sampler slot. Metal
+  // 1x1 placeholder bound to unbound fragment sampler slot. Metal
   // requires texture+sampler at every index the shader declares;
   // unbound slot faults encoder. Classic trigger: Reset clearing all
   // textures before app re-binds. Lazily created on encode thread.
@@ -2062,6 +2093,17 @@ public:
   // target's LockRect: drain queued draws, blit the surface's texture
   // into an m_uploadRing block, wait for retirement, memcpy into the
   // surface's mirror. Same drain + wait tail as GetRenderTargetData.
+  // Waits for the GPU to reach a sequence value, abandoning the wait if the
+  // queue reports that a command buffer failed. Waiting without a bound is only
+  // correct while the buffer that would raise the event can still complete: a
+  // failed one never signals it, so the caller would block for the remaining
+  // life of the process. Metal reports running out of device memory as exactly
+  // such a failure, which an application reaches by asking for more than the
+  // device has, so this is an ordinary outcome rather than a corrupt state.
+  // Returns false when the wait was abandoned; the caller reports the failure
+  // through whatever its own contract allows.
+  bool waitForGpuOrDeviceError(uint64_t value);
+
   void readbackSurfaceMirror(class MTLD3D9Surface *surface);
 
   // Force a staged Clear (m_pendingClear) onto the CURRENT bindings by
