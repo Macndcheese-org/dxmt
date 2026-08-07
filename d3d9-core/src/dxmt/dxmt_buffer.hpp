@@ -1,0 +1,272 @@
+#pragma once
+
+#include "Metal.hpp"
+#include "dxmt_deptrack.hpp"
+#include "dxmt_residency.hpp"
+#include "dxmt_allocation.hpp"
+#include "rc/util_rc_ptr.hpp"
+#include "thread.hpp"
+#include "util_flags.hpp"
+#include "util_svector.hpp"
+#include <atomic>
+#include <cstdint>
+
+namespace dxmt {
+
+enum class BufferAllocationFlag : uint32_t {
+  GpuReadonly = 0,
+  NoTracking = 0,
+  GpuPrivate = 1,
+  CpuInvisible = 1,
+  CpuWriteCombined = 2,
+  OwnedByCommandList = 3,
+  GpuManaged = 4,
+  /* will allocate at least one page of memory and try to suballocate from that */
+  SuballocateFromOnePage = 5,
+  CpuPlaced = 6,
+  /* low-address CPU mapping with a separate Metal-owned backing buffer */
+  CpuShadow = 7,
+  /* external CPU allocation supplied by the application; never free it */
+  ExternalCpuPlaced = 8,
+};
+
+// Process-wide high-water of live CpuPlaced buffer-allocation bytes. A
+// CpuPlaced allocation registers its app-owned backing with Metal, so on a
+// 32-bit host each live one holds low-4GB address space until its command
+// buffer retires and the last reference drops. Maintained by the allocation
+// ctor/dtor (a relaxed atomic add and sub); read only for diagnostics, and
+// never reset so it survives to device teardown.
+uint64_t cpu_placed_peak_bytes();
+
+typedef uint64_t BufferViewKey;
+
+struct BufferViewDescriptor {
+  WMTPixelFormat format;
+  WMTTextureUsage usage = WMTTextureUsageShaderRead;
+  WMTTextureType type = WMTTextureTypeTextureBuffer;
+  uint32_t byteOffset = 0;
+  uint32_t byteLength = 0;
+};
+
+class Buffer;
+
+struct BufferView {
+  WMT::Reference<WMT::Texture> texture;
+  uint64_t gpu_resource_id;
+  uint64_t suballocation_texel;
+  DXMT_RESOURCE_RESIDENCY_STATE residency{};
+
+  BufferView(WMT::Reference<WMT::Texture> &&texture, uint64_t gpu_resource_id, uint64_t suballocation_texel) :
+      texture(std::move(texture)),
+      gpu_resource_id(gpu_resource_id),
+      suballocation_texel(suballocation_texel) {}
+};
+
+class BufferAllocation : public Allocation {
+  friend class Buffer;
+
+public:
+
+  WMT::Buffer
+  buffer() const {
+    return obj_;
+  }
+
+  WMTResourceOptions
+  resourceOptions() const noexcept {
+    return info_.options;
+  }
+
+  uint64_t
+  length() const noexcept {
+    return info_.length;
+  }
+
+  Flags<BufferAllocationFlag>
+  flags() const {
+    return flags_;
+  }
+
+  void *
+  mappedMemory(uint32_t sub) const noexcept {
+    if (!mappedMemory_)
+      return nullptr;
+    return reinterpret_cast<void *>(reinterpret_cast<std::uintptr_t>(mappedMemory_) + sub * suballocation_size_);
+  }
+
+  /** D3D12 Map/Unmap refcount: host mapping must stay valid while > 0. */
+  void addCpuMapRef() noexcept {
+    cpu_map_refs_.fetch_add(1u, std::memory_order_acq_rel);
+  }
+
+  void releaseCpuMapRef() noexcept {
+    uint32_t prev = cpu_map_refs_.load(std::memory_order_acquire);
+    while (prev > 0) {
+      if (cpu_map_refs_.compare_exchange_weak(prev, prev - 1,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+        return;
+    }
+  }
+
+  uint32_t cpuMapRefs() const noexcept {
+    return cpu_map_refs_.load(std::memory_order_acquire);
+  }
+
+  /**
+   * Trap-fill host-only mappings before reclaim. Must not touch Metal Shared
+   * contents: those remain GPU-visible while command buffers retain the
+   * MTLBuffer after D3D resource Release.
+   */
+  void poisonHostMapping(const char *reason) noexcept;
+
+  uint64_t
+  gpuAddress() const noexcept {
+    return gpuAddress_;
+  }
+
+  void
+  useSuballocation(uint32_t suballocation) noexcept {
+    current_suballocation_ = suballocation;
+  };
+
+  bool
+  hasSuballocatoin(uint32_t suballocation) const noexcept {
+    return suballocation < suballocation_count_;
+  }
+
+  uint64_t
+  currentSuballocationOffset() const noexcept {
+    return current_suballocation_ * suballocation_size_;
+  }
+
+  uint64_t
+  currentSuballocationOffset(uint64_t stride) const noexcept {
+    return current_suballocation_ * stride;
+  }
+
+  uint32_t currentSuballocation() {
+    return current_suballocation_;
+  }
+
+  void
+  updateContents(uint64_t offset, const void *data, uint64_t length, uint32_t suballocation = 0) noexcept {
+    if (unlikely(!length))
+      return;
+    auto absolute_offset = suballocation * suballocation_size_ + offset;
+    if (likely(mappedMemory_ != nullptr && !flags_.test(BufferAllocationFlag::GpuManaged))) {
+      memcpy(reinterpret_cast<char *>(mappedMemory_) + absolute_offset, data, length);
+      if (flags_.test(BufferAllocationFlag::CpuShadow))
+        obj_.updateContents(absolute_offset, data, length);
+      return;
+    }
+    obj_.updateContents(absolute_offset, data, length);
+  }
+
+  void
+  flushCpuShadow(uint64_t offset, uint64_t length, uint32_t suballocation = 0) noexcept;
+
+  void
+  didModifyRange(uint64_t offset, uint64_t length, uint32_t suballocation = 0) noexcept {
+    if (unlikely(!length))
+      return;
+    if (!flags_.test(BufferAllocationFlag::GpuManaged))
+      return;
+    if (unlikely(suballocation >= suballocation_count_ || offset >= suballocation_size_))
+      return;
+    auto max_length = suballocation_size_ - offset;
+    if (length > max_length)
+      length = max_length;
+    obj_.didModifyRange(suballocation * suballocation_size_ + offset, length);
+  }
+
+  DXMT_RESOURCE_RESIDENCY_STATE residencyState;
+  small_vector<GenericAccessTracker, 1> fenceTrackers;
+
+private:
+  BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
+  BufferAllocation(WMT::Reference<WMT::Buffer> &&buffer,
+                   const WMTBufferInfo &info,
+                   Flags<BufferAllocationFlag> flags);
+  ~BufferAllocation();
+
+  BufferAllocation(const BufferAllocation &) = delete;
+  BufferAllocation(BufferAllocation &&) = delete;
+
+  WMT::Reference<WMT::Buffer> obj_;
+  WMTBufferInfo info_ = {};
+  uint32_t version_ = 0;
+  Flags<BufferAllocationFlag> flags_;
+  small_vector<std::unique_ptr<BufferView>, 1> cached_view_;
+  void *mappedMemory_;
+  uint64_t gpuAddress_;
+  uint32_t current_suballocation_ = 0;
+  uint64_t suballocation_size_;
+  uint32_t suballocation_count_ = 1;
+  std::atomic<uint32_t> cpu_map_refs_{0};
+
+  void * placed_buffer = nullptr;
+};
+
+class Buffer {
+public:
+  void incRef();
+  void decRef();
+
+  BufferViewKey createView(BufferViewDescriptor const &);
+
+  constexpr BufferAllocation *
+  current() {
+    return current_.ptr();
+  }
+
+  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+  Rc<BufferAllocation> allocatePlaced(WMT::Heap heap, uint64_t offset,
+                                      Flags<BufferAllocationFlag> flags);
+  Rc<BufferAllocation> allocateExternalCpu(Flags<BufferAllocationFlag> flags,
+                                           void *memory);
+
+  Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
+
+  Buffer(uint64_t length, WMT::Device device) : length_(length), device_(device) {}
+
+  WMT::Texture view(BufferViewKey key);
+  WMT::Texture view(BufferViewKey key, BufferAllocation *allocation);
+
+  BufferView const &view_(BufferViewKey key); 
+  BufferView const &view_(BufferViewKey key, BufferAllocation *allocation);
+  BufferView *tryView(BufferViewKey key, BufferAllocation *allocation);
+
+  DXMT_RESOURCE_RESIDENCY_STATE &residency(BufferViewKey key);
+  DXMT_RESOURCE_RESIDENCY_STATE &residency(BufferViewKey key, BufferAllocation *allocation);
+
+  constexpr uint64_t
+  length() {
+    return length_;
+  };
+
+  WMTPixelFormat pixelFormat(BufferViewKey view) const {
+    return viewDescriptors_[view].format;
+  }
+
+private:
+  void prepareAllocationViews(BufferAllocation *allocation);
+
+  uint64_t length_;
+
+  Rc<BufferAllocation> current_;
+  std::atomic<uint32_t> refcount_ = {0u};
+
+  std::vector<BufferViewDescriptor> viewDescriptors_;
+  dxmt::mutex mutex_;
+  WMT::Device device_;
+};
+
+struct BufferSlice {
+  uint32_t byteOffset = 0;
+  uint32_t byteLength = 0;
+  uint32_t firstElement = 0;
+  uint32_t elementCount = 0;
+};
+
+} // namespace dxmt

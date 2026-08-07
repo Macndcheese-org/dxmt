@@ -1,0 +1,34 @@
+option('native_llvm_path', type : 'string', value: '/usr/local/opt/llvm@15')
+option('native_llvm_link_args', type : 'array', value: [
+  '-lLLVMBitReader',
+  '-lLLVMCore',
+  '-lLLVMRemarks',
+  '-lLLVMBinaryFormat',
+  '-lLLVMBitstreamReader',
+  '-lLLVMSupport',
+  '-lLLVMDemangle',
+  '-lm',
+  '-lz',
+  '-lcurses',
+  '-lxml2',
+], description : 'Native LLVM static library closure resolved by dxmt-builder')
+option('windows_llvm_path', type : 'string', value: '', description : 'LLVM Windows libraries used by the optional airconv PE target')
+option('build_airconv_for_windows', type : 'boolean', value : false)
+option('dxmt_debug', type : 'boolean', value : false)
+option('dxmt_version', type : 'string', value : '')
+option('dxmt_native', type : 'boolean', value : false, deprecated : true)
+option('wine_build_path', type : 'string', value : '.cache/wine/build/x86_64', description : 'Managed Wine build/cache directory; leave empty when using wine_install_path')
+option('wine_source_path', type : 'string', value : 'external/wine', description : 'Wine source dependency used by the managed build')
+option('wine_configure_args', type : 'array', value : ['--enable-archs=i386,x86_64'])
+option('wine_install_path', type : 'string', description : 'Complete external Wine cache root used for linking and runtime tests')
+option('wine_builtin_dll', type : 'boolean', value : true)
+option('enable_tests', type : 'boolean', value : false, description : 'Build Wine GoogleTest unit tests and serial Google Benchmark workloads')
+option('enable_nvapi', type : 'boolean', value : false)
+option('enable_nvngx', type : 'boolean', value : false)
+option('apitrace_builtin', type : 'boolean', value : false)
+option('apitrace_source_path', type : 'string', value : 'external/apitrace')
+option('apitrace_build_path', type : 'string', value : '')
+option('dxmt_builder_path', type : 'string', value : '', description : 'Optional dxmt-builder executable used for content-addressed generated artifacts')
+option('dxmt_builder_config_path', type : 'string', value : '', description : 'Optional dxmt-builder config passed to generated artifact commands')
+option('dxmt_cache_root', type : 'string', value : '', description : 'Managed cache root recorded by dxmt-builder')
+option('windows_oracle_only', type : 'boolean', value : false, description : 'Build only the native Windows Public API D3D test executables')

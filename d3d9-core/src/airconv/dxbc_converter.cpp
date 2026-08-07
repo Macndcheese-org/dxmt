@@ -1,0 +1,3094 @@
+#include "dxbc_converter.hpp"
+#include "DXBCParser/BlobContainer.h"
+#include "DXBCParser/ShaderBinary.h"
+#include "airconv_dx12_metal4.h"
+#include "airconv_error.hpp"
+#include "airconv_internal.hpp"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/FMF.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <bit>
+#include <cstdlib>
+#include <memory>
+#include <vector>
+
+#include "metallib_writer.hpp"
+#include "nt/air_builder.hpp"
+#include "shader_common.hpp"
+
+#include "airconv_context.hpp"
+
+#include "ftl.hpp"
+
+namespace dxmt::dxbc {
+
+// bindless-mirror toggles (defined here so both the parse-time and rebuild-time
+// argument-buffer builders can see them). Setters are exported below.
+static thread_local bool gBindlessMirrorTextureSrvPrototype = false;
+static thread_local bool gBindlessMirror = false;
+static thread_local bool gNativeDescriptorTable = false;
+
+constexpr uint32_t kCBufferBindingSlotCapacity = 14;
+
+uint32_t cbuffer_binding_range_size(const ResourceRange &range) {
+  const uint32_t range_size = range.size ? range.size : 1;
+  if (range.binding_slot >= kCBufferBindingSlotCapacity)
+    return 0;
+  const uint32_t capacity = kCBufferBindingSlotCapacity - range.binding_slot;
+  return range_size == UINT_MAX ? capacity : std::min(range_size, capacity);
+}
+
+static bool
+DemoteSingleSampleMsaaSrv(ShaderInfo &shader_info, uint32_t slot) {
+  using dxmt::shader::common::ResourceType;
+  auto iter = shader_info.srvMap.find(slot);
+  if (iter == shader_info.srvMap.end()) {
+    return false;
+  }
+
+  auto &resource_type = iter->second.resource_type;
+  switch (resource_type) {
+  case ResourceType::Texture2DMultisampled:
+    resource_type = ResourceType::Texture2D;
+    break;
+  case ResourceType::Texture2DMultisampledArray:
+    resource_type = ResourceType::Texture2DArray;
+    break;
+  default:
+    return false;
+  }
+
+  return true;
+}
+
+static void
+DemoteSingleSampleMsaaSrvs(
+  ShaderInfo &shader_info,
+  uint64_t mask_lo,
+  uint64_t mask_hi
+) {
+  for (uint32_t slot = 0; slot < 64; slot++) {
+    if (mask_lo & (uint64_t(1) << slot)) {
+      DemoteSingleSampleMsaaSrv(shader_info, slot);
+    }
+    if (mask_hi & (uint64_t(1) << slot)) {
+      DemoteSingleSampleMsaaSrv(shader_info, slot + 64);
+    }
+  }
+}
+
+static void
+RebuildArgumentBindingTables(ShaderInfo &shader_info) {
+  using namespace dxmt::air;
+  using dxmt::shader::common::ResourceType;
+
+  shader_info.binding_table = {};
+  shader_info.binding_table_cbuffer = {};
+
+  auto &binding_table = shader_info.binding_table;
+  auto &binding_table_cbuffer = shader_info.binding_table_cbuffer;
+
+  // In bindless-mirror mode each per-resource argument-buffer field becomes a
+  // typed array sized to the heap-mirror capacity; the shader indexes it by
+  // root_base + reflected_local_index. See BINDLESS-ABI.md.
+  const uint32_t mirror_n = gBindlessMirror ? kBindlessMirrorCapacity : 1;
+
+  for (auto &[range_id, cbv] : shader_info.cbufferMap) {
+    auto binding_slot = cbv.range.binding_slot;
+    if (gBindlessMirror) {
+      // One uint4* mirror array per CBV range; indexed by root_base + descriptor.
+      cbv.arg_index = binding_table_cbuffer.DefineBuffer(
+        "cb" + std::to_string(range_id), AddressSpace::constant,
+        MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot),
+        std::nullopt, mirror_n
+      );
+      continue;
+    }
+    const uint32_t range_size = cbuffer_binding_range_size(cbv.range);
+    cbv.arg_index = binding_table_cbuffer.Size();
+    for (uint32_t i = 0; i < range_size; i++) {
+      const auto name = range_size == 1
+                          ? "cb" + std::to_string(range_id)
+                          : "cb" + std::to_string(range_id) + "_" + std::to_string(i);
+      binding_table_cbuffer.DefineBuffer(
+        name, AddressSpace::constant, MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot + i)
+      );
+    }
+  }
+
+  for (auto &[range_id, sampler] : shader_info.samplerMap) {
+    auto binding_slot = sampler.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
+    sampler.arg_index = binding_table.DefineSampler(
+      "s" + std::to_string(range_id), attr_index, mirror_n);
+    sampler.arg_cube_index = binding_table.DefineSampler(
+      "cube_s" + std::to_string(range_id), attr_index + 1, mirror_n);
+    sampler.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_s" + std::to_string(range_id), attr_index + 2, mirror_n
+    );
+  }
+
+  for (auto &[range_id, srv] : shader_info.srvMap) {
+    auto binding_slot = srv.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
+    if (srv.resource_type != ResourceType::NonApplicable) {
+      auto access = srv.sampled ? MemoryAccess::sample : MemoryAccess::read;
+      auto texture_kind = to_air_resource_type(srv.resource_type, srv.compared);
+      auto scaler_type = to_air_scaler_type(srv.scaler_type);
+      srv.arg_index = binding_table.DefineTexture(
+        "t" + std::to_string(range_id), texture_kind, access, scaler_type,
+        attr_index, std::nullopt, mirror_n
+      );
+    } else {
+      srv.arg_index = binding_table.DefineBuffer(
+        "t" + std::to_string(range_id), AddressSpace::device,
+        MemoryAccess::read, msl_uint, attr_index, std::nullopt, mirror_n
+      );
+    }
+    srv.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_t" + std::to_string(range_id), attr_index + 1, mirror_n
+    );
+  }
+
+  for (auto &[range_id, uav] : shader_info.uavMap) {
+    auto access =
+      uav.written ? (uav.read ? MemoryAccess::read_write : MemoryAccess::write)
+                  : MemoryAccess::read;
+    auto binding_slot = uav.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, binding_slot);
+    if (uav.resource_type != ResourceType::NonApplicable) {
+      auto texture_kind = to_air_resource_type(uav.resource_type);
+      auto scaler_type = to_air_scaler_type(uav.scaler_type);
+      uav.arg_index = binding_table.DefineTexture(
+        "u" + std::to_string(range_id), texture_kind, access, scaler_type,
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
+      );
+    } else {
+      uav.arg_index = binding_table.DefineBuffer(
+        "u" + std::to_string(range_id), AddressSpace::device, access, msl_uint,
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
+      );
+    }
+    uav.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_u" + std::to_string(range_id), attr_index + 1, mirror_n
+    );
+    if (uav.with_counter) {
+      uav.arg_counter_index = binding_table.DefineBuffer(
+        "counter" + std::to_string(range_id), AddressSpace::device,
+        MemoryAccess::read_write, msl_uint, attr_index + 2,
+        uav.rasterizer_order ? std::optional(1) : std::nullopt, mirror_n
+      );
+    }
+  }
+}
+
+inline dxmt::shader::common::ResourceType
+to_shader_resource_type(microsoft::D3D10_SB_RESOURCE_DIMENSION dim) {
+  switch (dim) {
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_UNKNOWN:
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_BUFFER:
+  case microsoft::D3D11_SB_RESOURCE_DIMENSION_RAW_BUFFER:
+  case microsoft::D3D11_SB_RESOURCE_DIMENSION_STRUCTURED_BUFFER:
+    return shader::common::ResourceType::TextureBuffer;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE1D:
+    return shader::common::ResourceType::Texture1D;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2D:
+    return shader::common::ResourceType::Texture2D;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DMS:
+    return shader::common::ResourceType::Texture2DMultisampled;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE3D:
+    return shader::common::ResourceType::Texture3D;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBE:
+    return shader::common::ResourceType::TextureCube;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE1DARRAY:
+    return shader::common::ResourceType::Texture1DArray;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DARRAY:
+    return shader::common::ResourceType::Texture2DArray;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DMSARRAY:
+    return shader::common::ResourceType::Texture2DMultisampledArray;
+  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBEARRAY:
+    return shader::common::ResourceType::TextureCubeArray;
+  }
+  assert(0 && "invalid D3D10_SB_RESOURCE_DIMENSION");
+};
+
+inline dxmt::shader::common::ScalerDataType
+to_shader_scaler_type(microsoft::D3D10_SB_RESOURCE_RETURN_TYPE type) {
+  switch (type) {
+
+  case microsoft::D3D10_SB_RETURN_TYPE_UNORM:
+  case microsoft::D3D10_SB_RETURN_TYPE_SNORM:
+  case microsoft::D3D10_SB_RETURN_TYPE_FLOAT:
+    return shader::common::ScalerDataType::Float;
+  case microsoft::D3D10_SB_RETURN_TYPE_SINT:
+    return shader::common::ScalerDataType::Int;
+  case microsoft::D3D10_SB_RETURN_TYPE_UINT:
+    return shader::common::ScalerDataType::Uint;
+  case microsoft::D3D10_SB_RETURN_TYPE_MIXED:
+    return shader::common::ScalerDataType::Uint; // kinda weird but ok
+  case microsoft::D3D11_SB_RETURN_TYPE_DOUBLE:
+  case microsoft::D3D11_SB_RETURN_TYPE_CONTINUED:
+  case microsoft::D3D11_SB_RETURN_TYPE_UNUSED:
+    break;
+  }
+  // DOUBLE has no Metal Shading Language equivalent (which is why DXMT reports
+  // DoublePrecisionFloatShaderOps = FALSE), and CONTINUED/UNUSED are stream
+  // markers rather than element types. Falling off the end here was undefined
+  // behaviour once NDEBUG dropped the assert; return the same defined fallback
+  // the AIR signature path uses.
+  assert(0 && "invalid D3D10_SB_RESOURCE_RETURN_TYPE");
+  return shader::common::ScalerDataType::Float;
+}
+
+uint32_t next_pow2(uint32_t x) {
+  return x == 1 ? 1 : 1 << (32 - __builtin_clz(x - 1));
+}
+
+void set_bindless_mirror_texture_srv_prototype(bool enabled) {
+  gBindlessMirrorTextureSrvPrototype = enabled;
+}
+
+void set_bindless_mirror(bool enabled) { gBindlessMirror = enabled; }
+bool get_bindless_mirror() { return gBindlessMirror; }
+void set_native_descriptor_table(bool enabled) { gNativeDescriptorTable = enabled; }
+bool get_native_descriptor_table() { return gNativeDescriptorTable; }
+
+auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
+  return make_irvalue([=](context ctx) {
+    auto argbuf = ctx.function->getArg(argbuf_index);
+    auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+      llvm::cast<llvm::PointerType>(argbuf->getType())
+        ->getNonOpaquePointerElementType()
+    );
+    return ctx.builder.CreateLoad(
+      argbuf_struct_type->getElementType(index),
+      ctx.builder.CreateStructGEP(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType(),
+        argbuf, index
+      )
+    );
+  });
+};
+
+auto get_texture_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType()
+      );
+      auto array_ptr = ctx.builder.CreateStructGEP(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType(),
+        argbuf, index
+      );
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+        argbuf_struct_type->getElementType(index)
+      );
+      auto element_index = dyn_index ? dyn_index : ctx.builder.getInt32(0);
+      auto element_ptr = ctx.builder.CreateGEP(
+        array_ty, array_ptr, {ctx.builder.getInt32(0), element_index}
+      );
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
+    });
+  };
+};
+
+// --- bindless-mirror read helpers (see BINDLESS-ABI.md) ---
+// Load the absolute base slot (uint32) for a resource from the per-draw
+// root-offset buffer. element == arg_index == StructurePtrOffset.
+static auto get_root_base(uint32_t root_offset_arg_index, uint32_t arg_index) {
+  return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+    auto root_buf = ctx.function->getArg(root_offset_arg_index);
+    auto i32 = ctx.builder.getInt32Ty();
+    auto elem_ptr = ctx.builder.CreateGEP(
+      i32, root_buf, ctx.builder.getInt32(arg_index)
+    );
+    return ctx.builder.CreateLoad(i32, elem_ptr);
+  });
+}
+
+// Compute reflected_local_index = operand_index - range_lower_bound. The DXBC
+// resource operand index is the ABSOLUTE shader register (BaseRegister for SM5.0
+// single resources, BaseRegister + array element for SM5.1 bindless arrays);
+// subtracting the range lower bound yields the 0-based offset into the range,
+// which is the local index added to the mirror base. See BINDLESS-ABI.md.
+static llvm::Value *
+mirror_local_index(context &ctx, pvalue dyn_index, uint32_t range_lower_bound) {
+  llvm::Value *operand = dyn_index ? dyn_index : ctx.builder.getInt32(0);
+  if (range_lower_bound == 0)
+    return operand;
+  return ctx.builder.CreateSub(
+    operand, ctx.builder.getInt32(range_lower_bound)
+  );
+}
+
+static llvm::Value *
+buffer_table_qword_index(
+    context &ctx, pvalue dyn_index, uint32_t range_lower_bound,
+    uint32_t compact_base, uint32_t qword_offset) {
+  auto local = mirror_local_index(ctx, dyn_index, range_lower_bound);
+  auto descriptor_base = ctx.builder.CreateMul(
+      local, ctx.builder.getInt32(kBindlessBufferDescriptorQwords));
+  return ctx.builder.CreateAdd(
+      ctx.builder.getInt32(compact_base + qword_offset), descriptor_base);
+}
+
+static auto get_buffer_table_qword(
+    uint32_t buffer_table_index, uint32_t compact_base,
+    uint32_t range_lower_bound, uint32_t qword_offset) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto buf_table = ctx.function->getArg(buffer_table_index);
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          i64, buf_table,
+          buffer_table_qword_index(
+              ctx, dyn_index, range_lower_bound, compact_base, qword_offset));
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+static auto get_buffer_in_buffer_table(
+    uint32_t buffer_table_index, uint32_t compact_base,
+    uint32_t range_lower_bound, air::AddressSpace address_space,
+    uint32_t qword_offset = 0) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto address = get_buffer_table_qword(
+          buffer_table_index, compact_base, range_lower_bound,
+          qword_offset)(dyn_index)
+          .build(ctx);
+      if (auto err = address.takeError())
+        return std::move(err);
+
+      auto ptr_ty = ctx.builder.getInt32Ty()->getPointerTo(
+          static_cast<unsigned>(address_space));
+      return ctx.builder.CreateIntToPtr(address.get(), ptr_ty);
+    });
+  };
+}
+
+static auto get_cbuffer_in_buffer_table(
+    uint32_t buffer_table_index, uint32_t compact_base,
+    uint32_t range_lower_bound) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto address = get_buffer_table_qword(
+          buffer_table_index, compact_base, range_lower_bound, 0)(dyn_index)
+          .build(ctx);
+      if (auto err = address.takeError())
+        return std::move(err);
+
+      return ctx.builder.CreateIntToPtr(
+          address.get(),
+          ctx.types._int4->getPointerTo(
+              static_cast<unsigned>(air::AddressSpace::constant)));
+    });
+  };
+}
+
+static llvm::Value *
+native_descriptor_slot_index(
+    context &ctx, pvalue dyn_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound) {
+  llvm::Value *local = mirror_local_index(ctx, dyn_index, range_lower_bound);
+  auto root_bases = ctx.function->getArg(root_table_base_index);
+  auto i32 = ctx.builder.getInt32Ty();
+  auto base = ctx.builder.CreateLoad(
+      i32, ctx.builder.CreateGEP(i32, root_bases,
+                                 ctx.builder.getInt32(arg_index)));
+  return ctx.builder.CreateAdd(base, local);
+}
+
+static llvm::Value *
+native_descriptor_qword_index(
+    context &ctx, pvalue dyn_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound,
+    uint32_t qwords_per_descriptor, uint32_t qword_offset) {
+  auto slot = native_descriptor_slot_index(
+      ctx, dyn_index, root_table_base_index, arg_index, range_lower_bound);
+  auto slot64 = ctx.builder.CreateZExt(slot, ctx.builder.getInt64Ty());
+  return ctx.builder.CreateAdd(
+      ctx.builder.CreateMul(slot64,
+                            ctx.builder.getInt64(qwords_per_descriptor)),
+      ctx.builder.getInt64(qword_offset));
+}
+
+static auto get_native_descriptor_qword(
+    uint32_t descriptor_table_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound, uint32_t qword_offset) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto descriptor_table = ctx.function->getArg(descriptor_table_index);
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          i64, descriptor_table,
+          native_descriptor_qword_index(ctx, dyn_index, root_table_base_index,
+                                        arg_index, range_lower_bound, 3,
+                                        qword_offset));
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+template <typename HandleTypeFn>
+static auto get_native_typed_descriptor_handle(
+    uint32_t descriptor_table_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound, uint32_t qword_offset,
+    HandleTypeFn handle_type_fn) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto raw = get_native_descriptor_qword(
+          descriptor_table_index, root_table_base_index, arg_index,
+          range_lower_bound, qword_offset)(dyn_index)
+          .build(ctx);
+      if (auto err = raw.takeError())
+        return std::move(err);
+      return ctx.builder.CreateIntToPtr(raw.get(), handle_type_fn(ctx));
+    });
+  };
+}
+
+static auto get_native_buffer_record_qword(
+    uint32_t buffer_record_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound, uint32_t qword_offset) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto records = ctx.function->getArg(buffer_record_index);
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          i64, records,
+          native_descriptor_qword_index(ctx, dyn_index, root_table_base_index,
+                                        arg_index, range_lower_bound, 6,
+                                        qword_offset));
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+static llvm::Value *
+native_resource_table_qword(
+    context &ctx, uint32_t resource_table_index, llvm::Value *resource_index,
+    uint32_t qword_offset) {
+  auto resources = ctx.function->getArg(resource_table_index);
+  auto i64 = ctx.builder.getInt64Ty();
+  auto index64 = ctx.builder.CreateZExt(resource_index, i64);
+  auto qword_index = ctx.builder.CreateAdd(
+      ctx.builder.CreateMul(index64, ctx.builder.getInt64(4)),
+      ctx.builder.getInt64(qword_offset));
+  return ctx.builder.CreateLoad(
+      i64, ctx.builder.CreateGEP(i64, resources, qword_index));
+}
+
+static auto get_native_buffer_in_descriptor_record(
+    uint32_t buffer_record_index, uint32_t resource_table_index,
+    uint32_t root_table_base_index, uint32_t arg_index,
+    uint32_t range_lower_bound, air::AddressSpace address_space,
+    bool counter = false, uint32_t null_buffer_index = UINT32_MAX) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      const uint32_t resource_qword = counter ? 4u : 0u;
+      const uint32_t offset_qword = counter ? 5u : 1u;
+
+      auto resource_word = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, resource_qword)(dyn_index)
+          .build(ctx);
+      if (auto err = resource_word.takeError())
+        return std::move(err);
+      auto byte_offset = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, offset_qword)(dyn_index)
+          .build(ctx);
+      if (auto err = byte_offset.takeError())
+        return std::move(err);
+
+      auto resource_index =
+          ctx.builder.CreateTrunc(resource_word.get(), ctx.builder.getInt32Ty());
+      auto base = native_resource_table_qword(ctx, resource_table_index,
+                                             resource_index, 0);
+      auto address = ctx.builder.CreateAdd(base, byte_offset.get());
+      auto ptr_ty = ctx.builder.getInt32Ty()->getPointerTo(
+          static_cast<unsigned>(address_space));
+      auto descriptor_ptr = ctx.builder.CreateIntToPtr(address, ptr_ty);
+      if (null_buffer_index == UINT32_MAX)
+        return descriptor_ptr;
+      auto is_null = ctx.builder.CreateICmpEQ(
+          resource_index, ctx.builder.getInt32(0));
+      return ctx.builder.CreateSelect(
+          is_null, ctx.function->getArg(null_buffer_index), descriptor_ptr);
+    });
+  };
+}
+
+static auto get_native_cbuffer_in_descriptor_record(
+    uint32_t buffer_record_index, uint32_t resource_table_index,
+    uint32_t null_cbuffer_index, uint32_t root_table_base_index,
+    uint32_t arg_index, uint32_t range_lower_bound) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto resource_word = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, 0)(dyn_index)
+          .build(ctx);
+      if (auto err = resource_word.takeError())
+        return std::move(err);
+      auto byte_offset = get_native_buffer_record_qword(
+          buffer_record_index, root_table_base_index, arg_index,
+          range_lower_bound, 1)(dyn_index)
+          .build(ctx);
+      if (auto err = byte_offset.takeError())
+        return std::move(err);
+
+      auto resource_index =
+          ctx.builder.CreateTrunc(resource_word.get(), ctx.builder.getInt32Ty());
+      auto base = native_resource_table_qword(ctx, resource_table_index,
+                                             resource_index, 0);
+      auto address = ctx.builder.CreateAdd(base, byte_offset.get());
+      auto descriptor_ptr = ctx.builder.CreateIntToPtr(
+          address,
+          ctx.types._int4->getPointerTo(
+              static_cast<unsigned>(air::AddressSpace::constant)));
+      auto is_null = ctx.builder.CreateICmpEQ(
+          resource_index, ctx.builder.getInt32(0));
+      return ctx.builder.CreateSelect(
+          is_null, ctx.function->getArg(null_cbuffer_index), descriptor_ptr);
+    });
+  };
+}
+
+// --- bindless-mirror slot-30/29 SHARED PLANAR mirror read (textures + samplers) ---
+//
+// Texture/sampler handles must be loaded from typed argument-buffer entries so
+// Metal lowers them as real indirect texture/sampler arguments. Metadata lives in
+// parallel uint64 arrays in the same argument-buffer struct. The runtime mirrors
+// this layout as contiguous planes: texture handles then metadata; sampler
+// handles, cube handles, then lod-bias metadata.
+static llvm::Value *
+mirror_planar_slot_index(
+    context &ctx, pvalue dyn_index, uint32_t root_offset_arg_index,
+    uint32_t arg_index, uint32_t range_lower_bound) {
+  llvm::Value *slot = mirror_local_index(ctx, dyn_index, range_lower_bound);
+  if (root_offset_arg_index != UINT32_MAX) {
+    // Load root_offsets[arg_index] (absolute base slot) and add the local index.
+    // Inlined (rather than via get_root_base) to keep this a plain llvm::Value*.
+    auto root_buf = ctx.function->getArg(root_offset_arg_index);
+    auto i32 = ctx.builder.getInt32Ty();
+    auto base = ctx.builder.CreateLoad(
+        i32, ctx.builder.CreateGEP(i32, root_buf, ctx.builder.getInt32(arg_index)));
+    slot = ctx.builder.CreateAdd(base, slot);
+  }
+  return slot;
+}
+
+static auto get_mirror_qword_planar(
+    uint32_t mirror_index, uint32_t field_index,
+    uint32_t root_offset_arg_index, uint32_t arg_index,
+    uint32_t range_lower_bound) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto mirror = ctx.function->getArg(mirror_index);
+      auto mirror_struct_type = llvm::cast<llvm::StructType>(
+          llvm::cast<llvm::PointerType>(mirror->getType())
+              ->getNonOpaquePointerElementType());
+      auto array_ptr =
+          ctx.builder.CreateStructGEP(mirror_struct_type, mirror, field_index);
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+          mirror_struct_type->getElementType(field_index));
+      auto i64 = ctx.builder.getInt64Ty();
+      auto elem_ptr = ctx.builder.CreateGEP(
+          array_ty, array_ptr,
+          {ctx.builder.getInt32(0),
+           mirror_planar_slot_index(ctx, dyn_index, root_offset_arg_index,
+                                    arg_index, range_lower_bound)});
+      return ctx.builder.CreateLoad(i64, elem_ptr);
+    });
+  };
+}
+
+template <typename HandleTypeFn>
+static auto get_mirror_typed_handle_planar(
+    uint32_t mirror_index, uint32_t field_index,
+    uint32_t root_offset_arg_index, uint32_t arg_index,
+    uint32_t range_lower_bound, HandleTypeFn) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto mirror = ctx.function->getArg(mirror_index);
+      auto mirror_struct_type = llvm::cast<llvm::StructType>(
+          llvm::cast<llvm::PointerType>(mirror->getType())
+              ->getNonOpaquePointerElementType());
+      auto array_ptr =
+          ctx.builder.CreateStructGEP(mirror_struct_type, mirror, field_index);
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+          mirror_struct_type->getElementType(field_index));
+      auto element_ptr = ctx.builder.CreateGEP(
+          array_ty, array_ptr,
+          {ctx.builder.getInt32(0),
+           mirror_planar_slot_index(ctx, dyn_index, root_offset_arg_index,
+                                    arg_index, range_lower_bound)});
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
+    });
+  };
+}
+
+// Texture/sampler METADATA: the raw i64 qword (arrayLength|minLOD packing, or the
+// sampler lod_bias bits). Returned verbatim, matching the legacy i64 meta field.
+static auto get_mirror_meta_planar(
+    uint32_t mirror_index, uint32_t field_index,
+    uint32_t root_offset_arg_index, uint32_t arg_index,
+    uint32_t range_lower_bound) {
+  return get_mirror_qword_planar(
+      mirror_index, field_index, root_offset_arg_index, arg_index,
+      range_lower_bound);
+}
+
+// Read element `mirror.field[field_index][ root_base[arg_index] + local ]` from a
+// typed mirror argument-buffer array, where local = operand_index - lower_bound.
+// `field_index` selects the typed array field; element type is whatever the
+// Load* path consumes (texture handle ptr, buffer ptr, sampler, or i64 metadata).
+// When `root_offset_arg_index` is UINT32_MAX root_base is 0 (direct binding).
+static auto get_mirror_item_in_argbuf_binding_table(
+  uint32_t argbuf_index, uint32_t field_index,
+  uint32_t root_offset_arg_index, uint32_t arg_index, uint32_t range_lower_bound
+) {
+  return [=](pvalue dyn_index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+        llvm::cast<llvm::PointerType>(argbuf->getType())
+          ->getNonOpaquePointerElementType()
+      );
+      auto array_ptr = ctx.builder.CreateStructGEP(
+        argbuf_struct_type, argbuf, field_index
+      );
+      auto array_ty = llvm::cast<llvm::ArrayType>(
+        argbuf_struct_type->getElementType(field_index)
+      );
+      llvm::Value *element_index =
+        mirror_local_index(ctx, dyn_index, range_lower_bound);
+      if (root_offset_arg_index != UINT32_MAX) {
+        auto base = get_root_base(root_offset_arg_index, arg_index).build(ctx);
+        if (auto err = base.takeError())
+          return std::move(err);
+        element_index = ctx.builder.CreateAdd(base.get(), element_index);
+      }
+      auto element_ptr = ctx.builder.CreateGEP(
+        array_ty, array_ptr, {ctx.builder.getInt32(0), element_index}
+      );
+      return ctx.builder.CreateLoad(array_ty->getElementType(), element_ptr);
+    });
+  };
+};
+
+auto get_cbuffer_in_argbuf_binding_table(
+    uint32_t argbuf_index, uint32_t base_index, uint32_t lower_bound,
+    uint32_t range_count) {
+  return [=](pvalue index) {
+    return make_irvalue([=](context ctx) -> llvm::Expected<pvalue> {
+      if (!range_count)
+        return llvm::make_error<UnsupportedFeature>(
+            "SM5.1 constant buffer range has no supported binding slots");
+
+      auto argbuf = ctx.function->getArg(argbuf_index);
+      auto argbuf_struct_type = llvm::cast<llvm::StructType>(
+          llvm::cast<llvm::PointerType>(argbuf->getType())
+              ->getNonOpaquePointerElementType());
+
+      const auto load_field = [&](uint32_t field_index) -> pvalue {
+        return ctx.builder.CreateLoad(
+            argbuf_struct_type->getElementType(field_index),
+            ctx.builder.CreateStructGEP(
+                llvm::cast<llvm::PointerType>(argbuf->getType())
+                    ->getNonOpaquePointerElementType(),
+                argbuf, field_index));
+      };
+
+      if (index) {
+        const auto range_index = llvm::dyn_cast_or_null<llvm::ConstantInt>(index);
+        if (range_index) {
+          const auto absolute_index = range_index->getZExtValue();
+          if (absolute_index < lower_bound)
+            return llvm::make_error<UnsupportedFeature>(
+                "SM5.1 constant buffer range index is below the declared lower bound");
+          const auto range_offset = absolute_index - lower_bound;
+          if (range_count != UINT_MAX && range_offset >= range_count)
+            return llvm::make_error<UnsupportedFeature>(
+                "SM5.1 constant buffer range index is outside the declared range");
+          const auto field_index = base_index + static_cast<uint32_t>(range_offset);
+          return load_field(field_index);
+        }
+
+        auto selected = load_field(base_index);
+        for (uint32_t i = 1; i < range_count; i++) {
+          auto matches = ctx.builder.CreateICmpEQ(
+              index, ctx.builder.getInt32(lower_bound + i));
+          selected = ctx.builder.CreateSelect(matches, load_field(base_index + i),
+                                              selected);
+        }
+        return selected;
+      }
+
+      return load_field(base_index);
+    });
+  };
+};
+
+static uint32_t
+descriptor_range_qword_count(const ResourceRange &range) {
+  const uint32_t range_size = range.size ? range.size : 1;
+  return (range_size == UINT_MAX ? kBindlessMirrorCapacity : range_size) *
+         kBindlessBufferDescriptorQwords;
+}
+
+static uint32_t
+bindless_buffer_table_qword_count(const ShaderInfo *shader_info) {
+  uint32_t running_qword = 0;
+
+  for (auto &[range_id, cbv] : shader_info->cbufferMap)
+    running_qword += descriptor_range_qword_count(cbv.range);
+
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      running_qword += descriptor_range_qword_count(srv.range);
+  }
+
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable)
+      running_qword += descriptor_range_qword_count(uav.range);
+  }
+
+  return running_qword;
+}
+
+static air::MemoryAccess
+bindless_texture_mirror_access(const ShaderInfo *shader_info) {
+  bool sampled = false;
+  bool read = false;
+  bool written = false;
+
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    sampled |= srv.sampled || srv.compared;
+    read |= srv.read || srv.sampled || srv.compared;
+  }
+
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    read |= uav.read;
+    written |= uav.written;
+    if (!uav.read && !uav.written) {
+      read = true;
+      written = true;
+    }
+  }
+
+  if (written)
+    return read ? air::MemoryAccess::read_write : air::MemoryAccess::write;
+  if (sampled)
+    return air::MemoryAccess::sample;
+  return air::MemoryAccess::read;
+}
+
+static auto
+build_flat_texture_mirror_struct(const ShaderInfo *shader_info,
+                                 llvm::LLVMContext &context,
+                                 const llvm::DataLayout &layout) {
+  air::ArgumentBufferBuilder builder;
+  const auto mirror_access = bindless_texture_mirror_access(shader_info);
+  uint32_t field_index = 0;
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    builder.DefineTexture(
+        "tex_mirror_t" + std::to_string(range_id),
+        air::to_air_resource_type(srv.resource_type, srv.compared), mirror_access,
+        air::to_air_scaler_type(srv.scaler_type),
+        field_index++, std::nullopt,
+        kBindlessMirrorCapacity);
+    builder.DefineInteger64("tex_mirror_t_meta" + std::to_string(range_id),
+                            field_index++, kBindlessMirrorCapacity);
+  }
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable)
+      continue;
+    builder.DefineTexture(
+        "tex_mirror_u" + std::to_string(range_id),
+        air::to_air_resource_type(uav.resource_type), mirror_access,
+        air::to_air_scaler_type(uav.scaler_type),
+        field_index++, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        kBindlessMirrorCapacity);
+    builder.DefineInteger64("tex_mirror_u_meta" + std::to_string(range_id),
+                            field_index++, kBindlessMirrorCapacity);
+  }
+  return builder.Build(context, layout);
+}
+
+static auto
+build_flat_sampler_mirror_struct(llvm::LLVMContext &context,
+                                 const llvm::DataLayout &layout) {
+  air::ArgumentBufferBuilder builder;
+  builder.DefineSampler("sampler_mirror", /*location_index=*/0,
+                        kBindlessMirrorCapacity);
+  builder.DefineSampler("sampler_mirror_cube", /*location_index=*/1,
+                        kBindlessMirrorCapacity);
+  builder.DefineInteger64("sampler_mirror_lod", /*location_index=*/2,
+                          kBindlessMirrorCapacity);
+  return builder.Build(context, layout);
+}
+
+// True if the shader references any TEXTURE-mirror resource (SRV/UAV texture or a
+// TextureBuffer, which carries a gpu_resource_id and lives in the texture mirror).
+// Buffer SRV/UAV (NonApplicable) go to the slot-27 buffer table, not here.
+static bool
+bindless_uses_texture_mirror(const ShaderInfo *shader_info) {
+  for (auto &[range_id, srv] : shader_info->srvMap)
+    if (srv.resource_type != shader::common::ResourceType::NonApplicable)
+      return true;
+  for (auto &[range_id, uav] : shader_info->uavMap)
+    if (uav.resource_type != shader::common::ResourceType::NonApplicable)
+      return true;
+  return false;
+}
+
+static bool
+bindless_uses_sampler_mirror(const ShaderInfo *shader_info) {
+  return !shader_info->samplerMap.empty();
+}
+
+static bool
+native_uses_resource_descriptor_heap(const ShaderInfo *shader_info) {
+  return !shader_info->cbufferMap.empty() || !shader_info->srvMap.empty() ||
+         !shader_info->uavMap.empty();
+}
+
+static bool
+native_uses_buffer_descriptor_records(const ShaderInfo *shader_info) {
+  if (!shader_info->cbufferMap.empty())
+    return true;
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      return true;
+  }
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    if (uav.resource_type == shader::common::ResourceType::NonApplicable ||
+        uav.with_counter)
+      return true;
+  }
+  return false;
+}
+
+static bool
+native_uses_buffer_srv(const ShaderInfo *shader_info) {
+  for (auto &[range_id, srv] : shader_info->srvMap)
+    if (srv.resource_type == shader::common::ResourceType::NonApplicable)
+      return true;
+  return false;
+}
+
+static void
+add_texture_argument_flags(
+    MTL_SM50_SHADER_ARGUMENT_FLAG &flags, shader::common::ResourceType resource_type,
+    shader::common::ScalerDataType scaler_type, bool compared
+) {
+  switch (resource_type) {
+  case shader::common::ResourceType::Texture2DMultisampled:
+  case shader::common::ResourceType::Texture2DMultisampledArray:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED;
+    break;
+  case shader::common::ResourceType::Texture3D:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_3D;
+    break;
+  case shader::common::ResourceType::TextureCube:
+  case shader::common::ResourceType::TextureCubeArray:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_CUBE;
+    break;
+  default:
+    break;
+  }
+
+  switch (scaler_type) {
+  case shader::common::ScalerDataType::Uint:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_UINT;
+    break;
+  case shader::common::ScalerDataType::Int:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_SINT;
+    break;
+  default:
+    break;
+  }
+
+  if (compared) {
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_DEPTH;
+  }
+}
+
+void setup_binding_table(
+  const ShaderInfo *shader_info, io_binding_map &resource_map,
+  air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+  uint32_t argbuffer_constant_slot, uint32_t argbuffer_slot,
+  BindlessBindingSlots bindless_slots
+) {
+  uint32_t binding_table_index = ~0u;
+  uint32_t cbuf_table_index = ~0u;
+  // Legacy packed argument buffer (slot 30) — NOT bound in bindless-mirror mode.
+  // In bindless mode the slot-30/29 mirrors are flat arrays (defined below); the
+  // per-resource struct `binding_table` is still BUILT (it backs the args_reflection
+  // emission so StructurePtrOffset == arg_index for the runtime root_offsets), but
+  // it is not a shader input here.
+  if (!gBindlessMirror && !gNativeDescriptorTable &&
+      !shader_info->binding_table.Empty()) {
+    auto [type, metadata] = shader_info->binding_table.Build(
+      module.getContext(), module.getDataLayout()
+    );
+    std::string arg_name = "binding_table";
+    if (argbuffer_slot != kArgumentBufferBindIndex)
+      arg_name += std::to_string(argbuffer_slot);
+    binding_table_index =
+      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+        .location_index = argbuffer_slot, // kArgumentBufferBindIndex
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .struct_type = type,
+        .struct_type_info = metadata,
+        .arg_name = arg_name,
+      });
+  }
+
+  // Bindless-mirror slot-30 TEXTURE mirror + slot-29 SAMPLER mirror. Handles are
+  // typed indirect argument-buffer entries; metadata is read from the same bytes
+  // as raw qwords.
+  uint32_t texture_mirror_index = ~0u;
+  uint32_t sampler_mirror_index = ~0u;
+  if (gBindlessMirror && bindless_uses_texture_mirror(shader_info)) {
+    auto [type, metadata] = build_flat_texture_mirror_struct(
+        shader_info, module.getContext(), module.getDataLayout());
+    texture_mirror_index =
+      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+        .location_index = bindless_slots.texture_mirror,
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .struct_type = type,
+        .struct_type_info = metadata,
+        .arg_name = "tex_mirror",
+      });
+  }
+  if (gBindlessMirror && bindless_uses_sampler_mirror(shader_info)) {
+    auto [type, metadata] =
+        build_flat_sampler_mirror_struct(module.getContext(), module.getDataLayout());
+    sampler_mirror_index =
+      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+        .location_index = bindless_slots.sampler_mirror,
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .struct_type = type,
+        .struct_type_info = metadata,
+        .arg_name = "sampler_mirror",
+      });
+  }
+  if (!gBindlessMirror && !gNativeDescriptorTable &&
+      !shader_info->binding_table_cbuffer.Empty()) {
+    auto [type, metadata] = shader_info->binding_table_cbuffer.Build(
+      module.getContext(), module.getDataLayout()
+    );
+    std::string arg_name = "cbuffer_table";
+    if (argbuffer_constant_slot != kConstantBufferBindIndex)
+      arg_name += std::to_string(argbuffer_constant_slot);
+    cbuf_table_index =
+      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+        .location_index = argbuffer_constant_slot, // kConstantBufferBindIndex
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .struct_type = type,
+        .struct_type_info = metadata,
+        .arg_name = arg_name,
+      });
+  }
+
+  uint32_t buffer_table_index = ~0u;
+  if (gBindlessMirror && bindless_buffer_table_qword_count(shader_info)) {
+    buffer_table_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = std::nullopt,
+      .location_index = bindless_slots.buffer_table,
+      .array_size = 1,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_ulong,
+      .arg_name = "buf_table",
+      .raster_order_group = std::nullopt,
+    });
+  }
+
+  uint32_t native_descriptor_heap_index = ~0u;
+  uint32_t native_sampler_heap_index = ~0u;
+  uint32_t native_resource_table_index = ~0u;
+  uint32_t native_buffer_record_index = ~0u;
+  uint32_t native_null_buffer_index = ~0u;
+  uint32_t native_null_cbuffer_index = ~0u;
+  uint32_t native_cbuffer_root_table_base_index = ~0u;
+  uint32_t native_root_table_base_index = ~0u;
+  if (gNativeDescriptorTable) {
+    if (native_uses_resource_descriptor_heap(shader_info)) {
+      native_descriptor_heap_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_descriptor_heap",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (!shader_info->samplerMap.empty()) {
+      native_sampler_heap_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_sampler_heap",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (native_uses_buffer_descriptor_records(shader_info)) {
+      native_resource_table_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_buffer_resource_table",
+            .raster_order_group = std::nullopt,
+          });
+      native_buffer_record_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_ulong,
+            .arg_name = "native_buffer_descriptor_records",
+            .raster_order_group = std::nullopt,
+          });
+      if (native_uses_buffer_srv(shader_info)) {
+        native_null_buffer_index =
+            func_signature.DefineInput(air::ArgumentBindingBuffer{
+              .buffer_size = std::nullopt,
+              .location_index = DXMT12_MTL4_NATIVE_NULL_BUFFER_BIND_INDEX,
+              .array_size = 1,
+              .memory_access = air::MemoryAccess::read,
+              .address_space = air::AddressSpace::device,
+              .type = air::msl_uint,
+              .arg_name = "native_null_buffer",
+              .raster_order_group = std::nullopt,
+            });
+      }
+    }
+    if (!shader_info->cbufferMap.empty()) {
+      native_null_cbuffer_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index = DXMT12_MTL4_NATIVE_NULL_CBUFFER_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint4,
+            .arg_name = "native_null_cbuffer",
+            .raster_order_group = std::nullopt,
+          });
+      native_cbuffer_root_table_base_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index =
+                DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "native_cbuffer_root_table_base",
+            .raster_order_group = std::nullopt,
+          });
+    }
+    if (!shader_info->samplerMap.empty() || !shader_info->srvMap.empty() ||
+        !shader_info->uavMap.empty()) {
+      native_root_table_base_index =
+          func_signature.DefineInput(air::ArgumentBindingBuffer{
+            .buffer_size = std::nullopt,
+            .location_index = DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "native_root_table_base",
+            .raster_order_group = std::nullopt,
+          });
+    }
+  }
+
+  // Per-draw root-offset buffer: element[arg_index] (== StructurePtrOffset) is
+  // the absolute base slot of that resource's descriptor-table range inside its
+  // typed mirror array. Only present in bindless-mirror mode; see BINDLESS-ABI.md.
+  uint32_t root_offset_index = ~0u;
+  if (gBindlessMirror) {
+    root_offset_index = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = std::nullopt,
+      .location_index = bindless_slots.root_offsets,
+      .array_size = 1,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_uint,
+      .arg_name = "root_offsets",
+      .raster_order_group = std::nullopt,
+    });
+  }
+
+  // Pick the reader for an argument-buffer field: legacy reads a single struct
+  // field (dynamic index ignored, SM5.0); bindless-mirror reads the typed array
+  // field at root_base[arg_index] + dyn_index. `field_index` == `arg_index` here
+  // because each resource owns exactly one binding-table field.
+  // Read a binding-table field. `field_index` selects the typed mirror array;
+  // `root_key` selects the root_offsets entry that holds the resource's absolute
+  // base slot. A resource's handle and its parallel metadata array share the same
+  // root_key (== the handle's arg_index) so both index the same descriptor slot.
+  auto read_field = [=](uint32_t field_index, uint32_t root_key,
+                        uint32_t lower_bound) -> IndexedIRValue {
+    if (gBindlessMirror)
+      return get_mirror_item_in_argbuf_binding_table(
+        binding_table_index, field_index, root_offset_index, root_key,
+        lower_bound);
+    return [=](pvalue) {
+      return get_item_in_argbuf_binding_table(binding_table_index, field_index);
+    };
+  };
+
+  // Bindless-mirror TEXTURE-handle read (slot-30 flat typed array, stride 2).
+  auto read_tex_handle = [=](const air::MSLTexture &tex, uint32_t field_index,
+                             uint32_t root_key,
+                             uint32_t lower_bound) -> IndexedIRValue {
+    return get_mirror_typed_handle_planar(
+        texture_mirror_index, field_index, root_offset_index, root_key,
+        lower_bound, [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); });
+  };
+  // TEXTURE metadata (qword 1 of the slot): raw i64.
+  auto read_tex_meta = [=](uint32_t field_index, uint32_t root_key,
+                           uint32_t lower_bound) -> IndexedIRValue {
+    return get_mirror_meta_planar(texture_mirror_index, field_index,
+                                  root_offset_index, root_key, lower_bound);
+  };
+  // SAMPLER read (slot-29 planar arrays): handle, cube handle, lod_bias bits.
+  auto read_sampler_handle = [=](uint32_t root_key, uint32_t lower_bound,
+                                 uint32_t qword_offset) -> IndexedIRValue {
+    return get_mirror_typed_handle_planar(
+        sampler_mirror_index, qword_offset, root_offset_index, root_key,
+        lower_bound,
+        [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); });
+  };
+  auto read_sampler_meta = [=](uint32_t root_key,
+                               uint32_t lower_bound) -> IndexedIRValue {
+    return get_mirror_meta_planar(sampler_mirror_index, /*field_index=*/2,
+                                  root_offset_index, root_key, lower_bound);
+  };
+
+  uint32_t compact_base = 0;
+  uint32_t texture_mirror_field = 0;
+  for (auto &[range_id, cbv] : shader_info->cbufferMap) {
+    auto index = cbv.arg_index;
+    if (gNativeDescriptorTable) {
+      resource_map.cb_range_map[range_id] =
+          get_native_cbuffer_in_descriptor_record(
+              native_buffer_record_index, native_resource_table_index,
+              native_null_cbuffer_index,
+              native_cbuffer_root_table_base_index, cbv.arg_index,
+              cbv.range.lower_bound);
+    } else if (gBindlessMirror) {
+      resource_map.cb_range_map[range_id] = get_cbuffer_in_buffer_table(
+          buffer_table_index, compact_base, cbv.range.lower_bound);
+      compact_base += descriptor_range_qword_count(cbv.range);
+    } else {
+      resource_map.cb_range_map[range_id] = get_cbuffer_in_argbuf_binding_table(
+          cbuf_table_index, index, cbv.range.lower_bound,
+          cbuffer_binding_range_size(cbv.range));
+    }
+  }
+  for (auto &[range_id, sampler] : shader_info->samplerMap) {
+    // SM5.0 ignores the dynamic index; bindless-mirror uses it. All three sampler
+    // values share the sampler's root_key (its arg_index) and address the same
+    // descriptor slot in the slot-29 flat sampler mirror (qw0 handle, qw1 cube,
+    // qw2 lod_bias). Legacy mode reads the three packed struct fields.
+    auto lb = sampler.range.lower_bound;
+    auto key = sampler.arg_index;
+    if (gNativeDescriptorTable) {
+      resource_map.sampler_range_map[range_id] = {
+        get_native_typed_descriptor_handle(
+            native_sampler_heap_index, native_root_table_base_index, key, lb,
+            /*qword_offset=*/0,
+            [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); }),
+        get_native_typed_descriptor_handle(
+            native_sampler_heap_index, native_root_table_base_index, key, lb,
+            /*qword_offset=*/1,
+            [](context &ctx) { return air::MSLSampler{}.get_llvm_type(ctx.llvm); }),
+        get_native_descriptor_qword(native_sampler_heap_index,
+                                    native_root_table_base_index, key, lb,
+                                    /*qword_offset=*/2)
+      };
+    } else if (gBindlessMirror) {
+      resource_map.sampler_range_map[range_id] = {
+        read_sampler_handle(key, lb, /*qword_offset=*/0),
+        read_sampler_handle(key, lb, /*qword_offset=*/1),
+        read_sampler_meta(key, lb)
+      };
+    } else {
+      resource_map.sampler_range_map[range_id] = {
+        read_field(sampler.arg_index, key, lb),
+        read_field(sampler.arg_cube_index, key, lb),
+        read_field(sampler.arg_metadata_index, key, lb)
+      };
+    }
+  }
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    auto lb = srv.range.lower_bound;
+    if (srv.resource_type != shader::common::ResourceType::NonApplicable) {
+      const uint32_t texture_handle_field = texture_mirror_field;
+      const uint32_t texture_meta_field = texture_mirror_field + 1;
+      if (gBindlessMirror)
+        texture_mirror_field += 2;
+      // TODO: abstract SM 5.0 binding
+      auto access =
+        srv.sampled ? air::MemoryAccess::sample : air::MemoryAccess::read;
+      auto texture_kind_logical = air::to_air_resource_type(srv.resource_type, srv.compared);
+      auto scaler_type = air::to_air_scaler_type(srv.scaler_type);
+      air::MSLTexture tex{
+        .component_type = scaler_type,
+        .memory_access = access,
+        .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
+        .resource_kind_logical = texture_kind_logical,
+      };
+      // Texture handle: bindless = slot-30 typed flat mirror; legacy = packed
+      // struct field (or the texture-srv prototype path).
+      auto handle =
+        gNativeDescriptorTable
+          ? get_native_typed_descriptor_handle(
+              native_descriptor_heap_index, native_root_table_base_index,
+              srv.arg_index, lb, /*qword_offset=*/1,
+              [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); })
+          : gBindlessMirror
+          ? read_tex_handle(tex, texture_handle_field, srv.arg_index, lb)
+          : ((gBindlessMirrorTextureSrvPrototype &&
+              srv.resource_type == shader::common::ResourceType::Texture2D)
+               ? get_texture_item_in_argbuf_binding_table(binding_table_index, srv.arg_index)
+               : read_field(srv.arg_index, srv.arg_index, lb));
+      auto meta =
+        gNativeDescriptorTable
+          ? get_native_descriptor_qword(
+              native_descriptor_heap_index, native_root_table_base_index,
+              srv.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror ? read_tex_meta(texture_meta_field, srv.arg_index, lb)
+                            : read_field(srv.arg_metadata_index, srv.arg_index, lb);
+      resource_map.srv_range_map[range_id] = {tex, handle, meta, false};
+      if (srv.resource_type == shader::common::ResourceType::TextureBuffer) {
+        // tbuffer carries a gpu_resource_id + (elementCount<<32|firstElement); it
+        // lives in the texture mirror, same handle/meta slot.
+        resource_map.srv_buf_range_map[range_id] = {
+          srv.structure_stride,
+          handle,
+          meta,
+          false
+        };
+      }
+    } else {
+      resource_map.srv_buf_range_map[range_id] = {
+        srv.structure_stride,
+        gNativeDescriptorTable
+          ? get_native_buffer_in_descriptor_record(
+              native_buffer_record_index, native_resource_table_index,
+              native_root_table_base_index, srv.arg_index, lb,
+              air::AddressSpace::device, /*counter=*/false,
+              native_null_buffer_index)
+          : gBindlessMirror
+          ? get_buffer_in_buffer_table(
+              buffer_table_index, compact_base, lb, air::AddressSpace::device)
+          : read_field(srv.arg_index, srv.arg_index, lb),
+        gNativeDescriptorTable
+          ? get_native_buffer_record_qword(
+              native_buffer_record_index, native_root_table_base_index,
+              srv.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror
+          ? get_buffer_table_qword(buffer_table_index, compact_base, lb, 1)
+          : read_field(srv.arg_metadata_index, srv.arg_index, lb),
+        false
+      };
+      if (gBindlessMirror)
+        compact_base += descriptor_range_qword_count(srv.range);
+    }
+  }
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    auto lb = uav.range.lower_bound;
+    auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
+                                          : air::MemoryAccess::write)
+                              : air::MemoryAccess::read;
+    if (uav.resource_type != shader::common::ResourceType::NonApplicable) {
+      const uint32_t texture_handle_field = texture_mirror_field;
+      const uint32_t texture_meta_field = texture_mirror_field + 1;
+      if (gBindlessMirror)
+        texture_mirror_field += 2;
+      auto texture_kind_logical = air::to_air_resource_type(uav.resource_type);
+      auto scaler_type = air::to_air_scaler_type(uav.scaler_type);
+      air::MSLTexture tex{
+        .component_type = scaler_type,
+        .memory_access = access,
+        .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
+        .resource_kind_logical = texture_kind_logical,
+      };
+      auto handle =
+        gNativeDescriptorTable
+          ? get_native_typed_descriptor_handle(
+              native_descriptor_heap_index, native_root_table_base_index,
+              uav.arg_index, lb, /*qword_offset=*/1,
+              [tex](context &ctx) { return tex.get_llvm_type(ctx.llvm); })
+          : gBindlessMirror ? read_tex_handle(tex, texture_handle_field, uav.arg_index, lb)
+                            : read_field(uav.arg_index, uav.arg_index, lb);
+      auto meta =
+        gNativeDescriptorTable
+          ? get_native_descriptor_qword(
+              native_descriptor_heap_index, native_root_table_base_index,
+              uav.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror ? read_tex_meta(texture_meta_field, uav.arg_index, lb)
+                            : read_field(uav.arg_metadata_index, uav.arg_index, lb);
+      resource_map.uav_range_map[range_id] = {tex, handle, meta, uav.global_coherent};
+      if (uav.resource_type == shader::common::ResourceType::TextureBuffer) {
+        resource_map.uav_buf_range_map[range_id] = {
+          uav.structure_stride,
+          handle,
+          meta,
+          uav.global_coherent
+        };
+        if (uav.with_counter) {
+          // A tbuffer counter is a buffer, but a tbuffer field reserves no buf_table
+          // slot (it is not a NonApplicable buffer). Legacy packed read is kept here;
+          // tbuffer-UAV-with-counter does not occur in the bindless SM5 corpus. If it
+          // ever does, give the counter its own buf_table slot.
+          resource_map.uav_counter_range_map[range_id] =
+            gNativeDescriptorTable
+              ? get_native_buffer_in_descriptor_record(
+                  native_buffer_record_index, native_resource_table_index,
+                  native_root_table_base_index, uav.arg_index, lb,
+                  air::AddressSpace::device, /*counter=*/true)
+              : read_field(uav.arg_counter_index, uav.arg_index, lb);
+        }
+      }
+    } else {
+      resource_map.uav_buf_range_map[range_id] = {
+        uav.structure_stride,
+        gNativeDescriptorTable
+          ? get_native_buffer_in_descriptor_record(
+              native_buffer_record_index, native_resource_table_index,
+              native_root_table_base_index, uav.arg_index, lb,
+              air::AddressSpace::device)
+          : gBindlessMirror
+          ? get_buffer_in_buffer_table(
+              buffer_table_index, compact_base, lb, air::AddressSpace::device)
+          : read_field(uav.arg_index, uav.arg_index, lb),
+        gNativeDescriptorTable
+          ? get_native_buffer_record_qword(
+              native_buffer_record_index, native_root_table_base_index,
+              uav.arg_index, lb, /*qword_offset=*/2)
+          : gBindlessMirror
+          ? get_buffer_table_qword(buffer_table_index, compact_base, lb, 1)
+          : read_field(uav.arg_metadata_index, uav.arg_index, lb),
+        uav.global_coherent
+      };
+      if (uav.with_counter) {
+        resource_map.uav_counter_range_map[range_id] =
+          gNativeDescriptorTable
+            ? get_native_buffer_in_descriptor_record(
+                native_buffer_record_index, native_resource_table_index,
+                native_root_table_base_index, uav.arg_index, lb,
+                air::AddressSpace::device, /*counter=*/true)
+            : gBindlessMirror
+            ? get_buffer_in_buffer_table(
+                buffer_table_index, compact_base, lb,
+                air::AddressSpace::device, 2)
+            : read_field(uav.arg_counter_index, uav.arg_index, lb);
+      }
+      if (gBindlessMirror)
+        compact_base += descriptor_range_qword_count(uav.range);
+    }
+  }
+};
+
+void setup_immediate_constant_buffer(
+  const ShaderInfo *shader_info, io_binding_map &resource_map,
+  air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
+) {
+  auto buffer_size = std::max(
+    shader_info->immConstantBufferData.size(),
+    static_cast<size_t>(shader_info->immConstantBufferMinSize)
+  );
+  if (!buffer_size) {
+    return;
+  }
+  auto &context = module.getContext();
+  auto type = llvm::ArrayType::get(
+    types._int4, buffer_size
+  );
+  const bool icb_data_missing = shader_info->immConstantBufferData.empty();
+  static constexpr std::array<uint32_t, 8> missing_icb_fallback = {
+    0x3e800000u, 0x3ea00000u, 0x3ec00000u, 0x3ee00000u,
+    0x3f200000u, 0x3f300000u, 0x3f400000u, 0x3f600000u,
+  };
+  llvm::SmallVector<llvm::Constant *> constants;
+  constants.reserve(buffer_size);
+  for (size_t i = 0; i < buffer_size; i++) {
+    std::array<uint32_t, 4> data = {};
+    if (i < shader_info->immConstantBufferData.size())
+      data = shader_info->immConstantBufferData[i];
+    else if (icb_data_missing) {
+      // Missing CUSTOMDATA has undefined contents. Use finite non-zero
+      // fallback bits so arithmetic does not collapse through all-zero ICB.
+      for (auto j = 0u; j < data.size(); j++)
+        data[j] = missing_icb_fallback[(i + j) % missing_icb_fallback.size()];
+    }
+    constants.push_back(llvm::ConstantVector::get(
+      {llvm::ConstantInt::get(context, llvm::APInt{32, data[0], false}),
+       llvm::ConstantInt::get(context, llvm::APInt{32, data[1], false}),
+       llvm::ConstantInt::get(context, llvm::APInt{32, data[2], false}),
+       llvm::ConstantInt::get(context, llvm::APInt{32, data[3], false})}
+    ));
+  }
+  auto const_data = llvm::ConstantArray::get(type, constants);
+  llvm::GlobalVariable *icb = new llvm::GlobalVariable(
+    module, type, true, llvm::GlobalValue::InternalLinkage, const_data, "icb",
+    nullptr, llvm::GlobalValue::NotThreadLocal, 2
+  );
+  icb->setAlignment(llvm::Align(4));
+  resource_map.icb = icb;
+  resource_map.icb_float = builder.CreateBitCast(
+    resource_map.icb, llvm::ArrayType::get(
+                        types._float4, buffer_size
+                      )
+                        ->getPointerTo(2)
+  );
+}
+
+void setup_tgsm(
+  const ShaderInfo *shader_info, io_binding_map &resource_map,
+  air::AirType &types, llvm::Module &module
+) {
+  for (auto &[id, tgsm] : shader_info->tgsmMap) {
+    auto type = llvm::ArrayType::get(types._int, tgsm.size_in_uint);
+    llvm::GlobalVariable *tgsm_h = new llvm::GlobalVariable(
+      module, type, false, llvm::GlobalValue::InternalLinkage,
+      llvm::UndefValue::get(type), "g" + std::to_string(id), nullptr,
+      llvm::GlobalValue::NotThreadLocal, 3
+    );
+    tgsm_h->setAlignment(llvm::Align(4));
+    resource_map.tgsm_map[id] = {tgsm.structured ? tgsm.stride : 0, tgsm_h};
+  }
+}
+
+void setup_temp_register(
+  const ShaderInfo *shader_info, io_binding_map &resource_map,
+  air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
+) {
+  resource_map.temp.ptr_int4 = builder.CreateAlloca(
+    llvm::ArrayType::get(types._int, 4 * shader_info->tempRegisterCount)
+  );
+  resource_map.temp.ptr_float4 = builder.CreateBitCast(
+    resource_map.temp.ptr_int4,
+    llvm::ArrayType::get(types._float, 4 * shader_info->tempRegisterCount)
+      ->getPointerTo()
+  );
+  for (auto &phase : shader_info->phases) {
+    resource_map.phases.push_back({});
+    auto &phase_temp = resource_map.phases.back();
+
+    phase_temp.temp.ptr_int4 = builder.CreateAlloca(
+      llvm::ArrayType::get(types._int, 4 * phase.tempRegisterCount)
+    );
+    phase_temp.temp.ptr_float4 = builder.CreateBitCast(
+      phase_temp.temp.ptr_int4,
+      llvm::ArrayType::get(types._float, 4 * phase.tempRegisterCount)
+        ->getPointerTo()
+    );
+
+    for (auto &[idx, info] : phase.indexableTempRegisterCounts) {
+      auto &[numRegisters, mask] = info;
+      auto channel_count = std::bit_width(mask);
+      auto ptr_int_vec = builder.CreateAlloca(llvm::ArrayType::get(types._int, numRegisters * channel_count));
+      auto ptr_float_vec = builder.CreateBitCast(
+          ptr_int_vec, llvm::ArrayType::get(types._float, numRegisters * channel_count)->getPointerTo()
+      );
+      phase_temp.indexable_temp_map[idx] = {
+        ptr_int_vec, ptr_float_vec, (uint32_t)channel_count
+      };
+    }
+  }
+  for (auto &[idx, info] : shader_info->indexableTempRegisterCounts) {
+    auto &[numRegisters, mask] = info;
+    auto channel_count = std::bit_width(mask);
+    auto ptr_int_vec = builder.CreateAlloca(llvm::ArrayType::get(types._int, numRegisters * channel_count));
+    auto ptr_float_vec = builder.CreateBitCast(
+        ptr_int_vec, llvm::ArrayType::get(types._float, numRegisters * channel_count)->getPointerTo()
+    );
+    resource_map.indexable_temp_map[idx] = {
+      ptr_int_vec, ptr_float_vec, (uint32_t)channel_count
+    };
+  }
+  if (shader_info->use_cmp_exch) {
+    resource_map.cmp_exch_temp = builder.CreateAlloca(types._int);
+  }
+}
+
+void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
+  using namespace llvm;
+  auto &context = module.getContext();
+  auto createUnsignedInteger = [&](uint32_t s) {
+    return ConstantAsMetadata::get(ConstantInt::get(context, APInt{32, s, false}));
+  };
+  auto createString = [&](auto s) { return MDString::get(context, s); };
+
+  auto airVersion = module.getOrInsertNamedMetadata("air.version");
+  auto airLangVersion = module.getOrInsertNamedMetadata("air.language_version");
+  switch (metal_version) {
+  case SM50_SHADER_METAL_320: {
+    airVersion->addOperand(
+        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(7), createUnsignedInteger(0)})
+    );
+    airLangVersion->addOperand(MDTuple::get(
+        context, {createString("Metal"), createUnsignedInteger(3), createUnsignedInteger(2), createUnsignedInteger(0)}
+    ));
+    module.setTargetTriple("air64-apple-macosx15.0.0");
+    break;
+  }
+  default: {
+    airVersion->addOperand(
+        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(6), createUnsignedInteger(0)})
+    );
+    airLangVersion->addOperand(MDTuple::get(
+        context, {createString("Metal"), createUnsignedInteger(3), createUnsignedInteger(1), createUnsignedInteger(0)}
+    ));
+    break;
+  }
+  }
+}
+
+llvm::Error convert_dxbc_pixel_shader(
+  SM50ShaderInternal *pShaderInternal, const char *name,
+  llvm::LLVMContext &context, llvm::Module &module,
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+) {
+  using namespace microsoft;
+
+  auto func_signature = pShaderInternal->func_signature; // copy
+  auto shader_info = &(pShaderInternal->shader_info);
+
+  uint32_t max_input_register = pShaderInternal->max_input_register;
+  uint32_t max_output_register = pShaderInternal->max_output_register;
+  uint32_t pso_sample_mask = 0xffffffff;
+  bool pso_dual_source_blending = false;
+  bool pso_disable_depth_output = false;
+  uint32_t pso_unorm_output_reg_mask = 0;
+  uint64_t demote_msaa_srv_mask_lo = 0;
+  uint64_t demote_msaa_srv_mask_hi = 0;
+  SM50_SHADER_PSO_PIXEL_SHADER_DATA *pso_data = nullptr;
+  if (args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pso_data)) {
+    pso_dual_source_blending = pso_data->dual_source_blending;
+    pso_disable_depth_output = pso_data->disable_depth_output;
+    pso_unorm_output_reg_mask = pso_data->unorm_output_reg_mask;
+    pso_sample_mask = pso_data->sample_mask;
+    demote_msaa_srv_mask_lo = pso_data->demote_msaa_srv_mask_lo;
+    demote_msaa_srv_mask_hi = pso_data->demote_msaa_srv_mask_hi;
+  }
+  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
+  SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
+  if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
+    metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
+  }
+  ShaderInfo shader_info_storage;
+  if (demote_msaa_srv_mask_lo || demote_msaa_srv_mask_hi) {
+    shader_info_storage = *shader_info;
+    DemoteSingleSampleMsaaSrvs(shader_info_storage, demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
+    RebuildArgumentBindingTables(shader_info_storage);
+    shader_info = &shader_info_storage;
+  }
+
+  IREffect prologue([](auto) { return std::monostate(); });
+  IRValue epilogue([](struct context ctx) -> pvalue {
+    auto retTy = ctx.function->getReturnType();
+    if (retTy->isVoidTy()) {
+      return nullptr;
+    }
+    return llvm::ConstantAggregateZero::get(retTy);
+  });
+
+  io_binding_map resource_map;
+  air::AirType types(context);
+
+  {
+    SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
+    sig_ctx.dual_source_blending = pso_dual_source_blending;
+    sig_ctx.disable_depth_output = pso_disable_depth_output;
+    sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
+    sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
+    sig_ctx.tessellation_primitive_id =
+        pso_data && pso_data->tessellation_primitive_id;
+    for (auto &p : pShaderInternal->signature_handlers) {
+      p(sig_ctx);
+    }
+  }
+  if (pso_sample_mask != 0xffffffff) {
+    auto assigned_index =
+      func_signature.DefineOutput(air::OutputCoverageMask{});
+    epilogue >> [=](pvalue value) -> IRValue {
+      return make_irvalue([=](struct context ctx) {
+        auto &builder = ctx.builder;
+        if (ctx.resource.coverage_mask_reg)
+          return value;
+        return builder.CreateInsertValue(
+          value, builder.getInt32(ctx.pso_sample_mask), {assigned_index}
+        );
+      });
+    };
+  }
+
+  setup_binding_table(shader_info, resource_map, func_signature, module);
+
+  auto [function, function_metadata] =
+    func_signature.CreateFunction(name, context, module, 0, false);
+
+  auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
+  auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
+  llvm::IRBuilder<> builder(entry_bb);
+  llvm::raw_null_ostream nulldbg{};
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+      },
+      builder, nulldbg
+  );
+
+  setup_metal_version(module, metal_version);
+
+  resource_map.input.ptr_int4 =
+    builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
+  resource_map.input.ptr_float4 = builder.CreateBitCast(
+    resource_map.input.ptr_int4,
+    llvm::ArrayType::get(types._float4, max_input_register)->getPointerTo()
+  );
+  resource_map.input_element_count = max_input_register;
+  resource_map.output.ptr_int4 =
+    builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register)
+    );
+  resource_map.output.ptr_float4 = builder.CreateBitCast(
+    resource_map.output.ptr_int4,
+    llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo()
+  );
+  resource_map.output_element_count = max_output_register;
+
+  setup_temp_register(shader_info, resource_map, types, module, builder);
+  setup_immediate_constant_buffer(
+    shader_info, resource_map, types, module, builder
+  );
+
+  struct context ctx {
+    .builder = builder, .air = air, .llvm = context, .module = module, .function = function,
+    .resource = resource_map, .types = types,
+    .pso_sample_mask = pso_sample_mask,
+    .shader_type = pShaderInternal->shader_type,
+    .metal_version = metal_version,
+  };
+
+  if (auto err = prologue.build(ctx).takeError()) {
+    return err;
+  }
+  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  if (auto err = real_entry.takeError()) {
+    return err;
+  }
+  builder.CreateBr(real_entry.get());
+
+  builder.SetInsertPoint(epilogue_bb);
+  auto epilogue_result = epilogue.build(ctx);
+  if (auto err = epilogue_result.takeError()) {
+    return err;
+  }
+  auto value = epilogue_result.get();
+  if (value == nullptr) {
+    builder.CreateRetVoid();
+  } else {
+    builder.CreateRet(value);
+  }
+
+  module.getOrInsertNamedMetadata("air.fragment")
+    ->addOperand(function_metadata);
+
+  return llvm::Error::success();
+};
+
+llvm::Error convert_dxbc_compute_shader(
+  SM50ShaderInternal *pShaderInternal, const char *name,
+  llvm::LLVMContext &context, llvm::Module &module,
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+) {
+  using namespace microsoft;
+
+  auto func_signature = pShaderInternal->func_signature; // copy
+  auto shader_info = &(pShaderInternal->shader_info);
+
+  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
+  SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
+  if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
+    metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
+  }
+
+  IREffect prologue([](auto) { return std::monostate(); });
+  IRValue epilogue([](struct context ctx) -> pvalue {
+    auto retTy = ctx.function->getReturnType();
+    if (retTy->isVoidTy()) {
+      return nullptr;
+    }
+    return llvm::ConstantAggregateZero::get(retTy);
+  });
+
+  io_binding_map resource_map;
+  air::AirType types(context);
+
+  {
+    SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
+    for (auto &p : pShaderInternal->signature_handlers) {
+      p(sig_ctx);
+    }
+  }
+
+  setup_binding_table(shader_info, resource_map, func_signature, module);
+  setup_tgsm(shader_info, resource_map, types, module);
+
+  auto [function, function_metadata] =
+    func_signature.CreateFunction(name, context, module, 0, false);
+
+  auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
+  auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
+  llvm::IRBuilder<> builder(entry_bb);
+  llvm::raw_null_ostream nulldbg{};
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+      },
+      builder, nulldbg
+  );
+
+  setup_metal_version(module, metal_version);
+  setup_temp_register(shader_info, resource_map, types, module, builder);
+  setup_immediate_constant_buffer(
+    shader_info, resource_map, types, module, builder
+  );
+
+  struct context ctx {
+    .builder = builder, .air = air, .llvm = context, .module = module, .function = function,
+    .resource = resource_map, .types = types, .pso_sample_mask = 0xffffffff,
+    .shader_type = pShaderInternal->shader_type,
+    .metal_version = metal_version,
+  };
+
+  if (auto err = prologue.build(ctx).takeError()) {
+    return err;
+  }
+  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  if (auto err = real_entry.takeError()) {
+    return err;
+  }
+  builder.CreateBr(real_entry.get());
+
+  builder.SetInsertPoint(epilogue_bb);
+
+  if (auto err = epilogue.build(ctx).takeError()) {
+    return err;
+  }
+  builder.CreateRetVoid();
+
+  module.getOrInsertNamedMetadata("air.kernel")->addOperand(function_metadata);
+
+  return llvm::Error::success();
+};
+
+llvm::Error convert_dxbc_vertex_shader(
+  SM50ShaderInternal *pShaderInternal, const char *name,
+  llvm::LLVMContext &context, llvm::Module &module,
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+) {
+  using namespace microsoft;
+
+  auto func_signature = pShaderInternal->func_signature; // copy
+  auto shader_info = &(pShaderInternal->shader_info);
+
+  uint32_t max_input_register = pShaderInternal->max_input_register;
+  uint32_t max_output_register = pShaderInternal->max_output_register;
+  SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA *vertex_so = nullptr;
+  args_get_data<SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT, SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA>(
+      pArgs, &vertex_so
+  );
+  SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout = nullptr;
+  args_get_data<SM50_SHADER_IA_INPUT_LAYOUT, SM50_SHADER_IA_INPUT_LAYOUT_DATA>(pArgs, &ia_layout);
+  SM50_SHADER_GS_PASS_THROUGH_DATA *gs_passthrough = nullptr;
+  bool rasterization_disabled =
+      (args_get_data<SM50_SHADER_GS_PASS_THROUGH, SM50_SHADER_GS_PASS_THROUGH_DATA>(pArgs, &gs_passthrough) &&
+       gs_passthrough->RasterizationDisabled) ||
+      (vertex_so != nullptr);
+  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
+  SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
+  if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
+    metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
+  }
+
+  IREffect prologue([](auto) { return std::monostate(); });
+  IRValue epilogue([](struct context ctx) -> pvalue {
+    auto retTy = ctx.function->getReturnType();
+    if (retTy->isVoidTy()) {
+      return nullptr;
+    }
+    return llvm::ConstantAggregateZero::get(retTy);
+  });
+
+  io_binding_map resource_map;
+  air::AirType types(context);
+
+  {
+    SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
+    sig_ctx.ia_layout = ia_layout;
+    sig_ctx.skip_vertex_output = rasterization_disabled;
+    for (auto &p : pShaderInternal->signature_handlers) {
+      p(sig_ctx);
+    }
+
+    for (auto& out : pShaderInternal->output_signature) {
+      if(out.isSystemValue()) continue;
+      func_signature.DefineOutput(air::OutputVertex{
+        .user = out.fullSemanticString(),
+        .type = to_msl_type(out.componentType()),
+      });
+    }
+  }
+  if (vertex_so) {
+    auto bv = func_signature.DefineInput(air::InputBaseVertex{});
+    auto vid = func_signature.DefineInput(air::InputVertexID{});
+    auto slot_0 = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = {},
+      .location_index = 20,
+      .array_size = 0,
+      .memory_access = air::MemoryAccess::write,
+      .address_space = air::AddressSpace::device,
+      .type = air::MSLUint{},
+      .arg_name = "so_slot0",
+      .raster_order_group = {}
+    });
+    epilogue << make_irvalue([=](struct context ctx) {
+      auto &builder = ctx.builder;
+      auto base_vertex = ctx.function->getArg(bv);
+      auto vertex_id = ctx.function->getArg(vid);
+      auto slot0 = ctx.function->getArg(slot_0);
+      auto adjusted_vertex_id = builder.CreateSub(vertex_id, base_vertex);
+      auto output_regs = builder.CreateBitOrPointerCast(
+        ctx.resource.output.ptr_int4, llvm::PointerType::get(ctx.types._int, 0)
+      );
+      for (unsigned i = 0; i < vertex_so->num_elements; i++) {
+        auto &element = vertex_so->elements[i];
+        if (element.reg_id == 0xffffffff)
+          continue;
+        auto ptr = ctx.builder.CreateConstGEP1_32(
+          ctx.types._int, output_regs,
+          (unsigned)(element.reg_id * 4 + element.component)
+        );
+        auto target_offset = ctx.builder.CreateAdd(
+          ctx.builder.CreateMul(
+            adjusted_vertex_id,
+            ctx.builder.getInt32(vertex_so->strides[element.output_slot])
+          ),
+          ctx.builder.getInt32(element.offset)
+        );
+        auto target_ptr = ctx.builder.CreateGEP(
+          ctx.types._int, slot0, {ctx.builder.CreateLShr(target_offset, 2)}
+        );
+        ctx.builder.CreateStore(
+          ctx.builder.CreateLoad(ctx.types._int, ptr), target_ptr, true
+        );
+      }
+      return nullptr;
+    });
+  }
+
+  uint32_t vertex_idx = func_signature.DefineInput(air::InputVertexID{});
+  uint32_t base_vertex_idx = func_signature.DefineInput(air::InputBaseVertex{});
+  uint32_t instance_idx = func_signature.DefineInput(air::InputInstanceID{});
+  uint32_t base_instance_idx =
+    func_signature.DefineInput(air::InputBaseInstance{});
+
+  uint32_t clip_distance_out_idx = ~0u;
+  const size_t metal_clip_distance_count =
+      pShaderInternal->clip_distance_scalars.size() +
+      pShaderInternal->cull_distance_scalars.size();
+  const bool emit_clip_distance = metal_clip_distance_count != 0;
+  if (emit_clip_distance) {
+    clip_distance_out_idx = func_signature.DefineOutput(
+      air::OutputClipDistance{metal_clip_distance_count}
+    );
+  };
+
+  setup_binding_table(shader_info, resource_map, func_signature, module);
+
+  uint32_t rta_idx_out = ~0u;
+  if (gs_passthrough && gs_passthrough->Data.RenderTargetArrayIndexReg != 255) {
+    rta_idx_out =
+      func_signature.DefineOutput(air::OutputRenderTargetArrayIndex{});
+  }
+  uint32_t va_idx_out = ~0u;
+  if (gs_passthrough && gs_passthrough->Data.ViewportArrayIndexReg != 255) {
+    va_idx_out = func_signature.DefineOutput(air::OutputViewportArrayIndex{});
+  }
+
+  auto [function, function_metadata] = func_signature.CreateFunction(
+    name, context, module, 0,
+    rasterization_disabled
+  );
+
+  auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
+  auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
+  llvm::IRBuilder<> builder(entry_bb);
+  llvm::raw_null_ostream nulldbg{};
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+      },
+      builder, nulldbg
+  );
+
+  setup_metal_version(module, metal_version);
+
+  resource_map.vertex_id_with_base = function->getArg(vertex_idx);
+  resource_map.base_vertex_id = function->getArg(base_vertex_idx);
+  resource_map.instance_id_with_base = function->getArg(instance_idx);
+  resource_map.base_instance_id = function->getArg(base_instance_idx);
+  resource_map.vertex_id = builder.CreateSub(
+    resource_map.vertex_id_with_base, resource_map.base_vertex_id
+  );
+  resource_map.instance_id = builder.CreateSub(
+    resource_map.instance_id_with_base, resource_map.base_instance_id
+  );
+
+  resource_map.input.ptr_int4 =
+    builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
+  resource_map.input.ptr_float4 = builder.CreateBitCast(
+    resource_map.input.ptr_int4,
+    llvm::ArrayType::get(types._float4, max_input_register)->getPointerTo()
+  );
+  resource_map.input_element_count = max_input_register;
+  resource_map.output.ptr_int4 =
+    builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register)
+    );
+  resource_map.output.ptr_float4 = builder.CreateBitCast(
+    resource_map.output.ptr_int4,
+    llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo()
+  );
+  resource_map.output_element_count = max_output_register;
+
+  setup_temp_register(shader_info, resource_map, types, module, builder);
+  setup_immediate_constant_buffer(
+    shader_info, resource_map, types, module, builder
+  );
+
+  struct context ctx {
+    .builder = builder, .air = air, .llvm = context, .module = module, .function = function,
+    .resource = resource_map, .types = types, .pso_sample_mask = 0xffffffff,
+    .shader_type = pShaderInternal->shader_type,
+    .metal_version = metal_version,
+  };
+
+  if (auto err = prologue.build(ctx).takeError()) {
+    return err;
+  }
+  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  if (auto err = real_entry.takeError()) {
+    return err;
+  }
+  builder.CreateBr(real_entry.get());
+
+  builder.SetInsertPoint(epilogue_bb);
+  auto epilogue_result = epilogue.build(ctx);
+  if (auto err = epilogue_result.takeError()) {
+    return err;
+  }
+  auto value = epilogue_result.get();
+
+  if (emit_clip_distance) {
+    auto clip_distance_ty = llvm::ArrayType::get(
+      types._float, metal_clip_distance_count
+    );
+    pvalue clip_distance_array = llvm::ConstantAggregateZero::get(clip_distance_ty);
+    unsigned clip_distance_idx = 0;
+    for (auto &scalar : pShaderInternal->clip_distance_scalars) {
+      auto src_ptr = builder.CreateGEP(
+        resource_map.output.ptr_float4->getType()
+          ->getNonOpaquePointerElementType(),
+        resource_map.output.ptr_float4,
+        {builder.getInt32(0), builder.getInt32(scalar.reg),
+         builder.getInt32(scalar.component)}
+      );
+      clip_distance_array = builder.CreateInsertValue(
+        clip_distance_array, builder.CreateLoad(types._float, src_ptr), {clip_distance_idx++}
+      );
+    }
+    for (auto &scalar : pShaderInternal->cull_distance_scalars) {
+      auto src_ptr = builder.CreateGEP(
+        resource_map.output.ptr_float4->getType()
+          ->getNonOpaquePointerElementType(),
+        resource_map.output.ptr_float4,
+        {builder.getInt32(0), builder.getInt32(scalar.reg),
+         builder.getInt32(scalar.component)}
+      );
+      clip_distance_array = builder.CreateInsertValue(
+        clip_distance_array, builder.CreateLoad(types._float, src_ptr), {clip_distance_idx++}
+      );
+    }
+    value = builder.CreateInsertValue(
+      value, clip_distance_array, {clip_distance_out_idx}
+    );
+  };
+
+  if (value == nullptr) {
+    builder.CreateRetVoid();
+  } else {
+    if (rta_idx_out != ~0u) {
+      auto src_ptr = builder.CreateGEP(
+        resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(
+        ),
+        resource_map.output.ptr_int4,
+        {builder.getInt32(0),
+         builder.getInt32(gs_passthrough->Data.RenderTargetArrayIndexReg),
+         builder.getInt32(gs_passthrough->Data.RenderTargetArrayIndexComponent)}
+      );
+      value = builder.CreateInsertValue(
+        value, builder.CreateLoad(types._int, src_ptr), {rta_idx_out}
+      );
+    }
+    if (va_idx_out != ~0u) {
+      auto src_ptr = builder.CreateGEP(
+        resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(
+        ),
+        resource_map.output.ptr_int4,
+        {builder.getInt32(0),
+         builder.getInt32(gs_passthrough->Data.ViewportArrayIndexReg),
+         builder.getInt32(gs_passthrough->Data.ViewportArrayIndexComponent)}
+      );
+      value = builder.CreateInsertValue(
+        value, builder.CreateLoad(types._int, src_ptr), {va_idx_out}
+      );
+    }
+    builder.CreateRet(value);
+  }
+
+  module.getOrInsertNamedMetadata("air.vertex")->addOperand(function_metadata);
+  return llvm::Error::success();
+};
+
+llvm::Error convertDXBC(
+  sm50_shader_t pShader, const char *name, llvm::LLVMContext &context,
+  llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+) {
+  using namespace microsoft;
+
+  auto pShaderInternal = (SM50ShaderInternal *)pShader;
+
+  switch (pShaderInternal->shader_type) {
+  case microsoft::D3D10_SB_PIXEL_SHADER:
+    return convert_dxbc_pixel_shader(
+      pShaderInternal, name, context, module, pArgs
+    );
+  case microsoft::D3D10_SB_VERTEX_SHADER:
+    return convert_dxbc_vertex_shader(
+      pShaderInternal, name, context, module, pArgs
+    );
+  case microsoft::D3D11_SB_COMPUTE_SHADER:
+    return convert_dxbc_compute_shader(
+      pShaderInternal, name, context, module, pArgs
+    );
+  case microsoft::D3D11_SB_HULL_SHADER:
+  case microsoft::D3D11_SB_DOMAIN_SHADER:
+    return llvm::make_error<UnsupportedFeature>(
+      "Hull and domain shader cannot be independently converted."
+    );
+  case microsoft::D3D10_SB_GEOMETRY_SHADER:
+    return llvm::make_error<UnsupportedFeature>(
+      "Geometry shader cannot be independently converted."
+    );
+  case microsoft::D3D12_SB_MESH_SHADER:
+  case microsoft::D3D12_SB_AMPLIFICATION_SHADER:
+  case microsoft::D3D11_SB_RESERVED0:
+    break;
+  }
+  return llvm::make_error<UnsupportedFeature>("Not supported shader type");
+};
+} // namespace dxmt::dxbc
+
+namespace {
+
+class SM50ShaderAbiScope {
+public:
+  explicit SM50ShaderAbiScope(SM50_SHADER_COMPILATION_ARGUMENT_DATA *args)
+      : previous_bindless_(dxmt::dxbc::get_bindless_mirror()),
+        previous_native_(dxmt::dxbc::get_native_descriptor_table()) {
+    DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
+        DXMT12_MTL4_SHADER_ABI_LEGACY;
+
+    DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *native_abi = nullptr;
+    if (dxmt::dxbc::args_get_data<
+            SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI,
+            DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA>(args, &native_abi) &&
+        native_abi && native_abi->enabled)
+      shader_abi_version = native_abi->version;
+
+    SM50_SHADER_BINDLESS_MIRROR_DATA *bindless = nullptr;
+    if (shader_abi_version == DXMT12_MTL4_SHADER_ABI_LEGACY &&
+        dxmt::dxbc::args_get_data<SM50_SHADER_BINDLESS_MIRROR,
+                                  SM50_SHADER_BINDLESS_MIRROR_DATA>(
+            args, &bindless) &&
+        bindless && bindless->enabled)
+      shader_abi_version = DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
+
+    dxmt::dxbc::set_bindless_mirror(
+        shader_abi_version == DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR);
+    dxmt::dxbc::set_native_descriptor_table(
+        shader_abi_version == DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE);
+  }
+
+  ~SM50ShaderAbiScope() {
+    dxmt::dxbc::set_bindless_mirror(previous_bindless_);
+    dxmt::dxbc::set_native_descriptor_table(previous_native_);
+  }
+
+  SM50ShaderAbiScope(const SM50ShaderAbiScope &) = delete;
+  SM50ShaderAbiScope &operator=(const SM50ShaderAbiScope &) = delete;
+
+private:
+  bool previous_bindless_;
+  bool previous_native_;
+};
+
+} // namespace
+
+bool CheckGSBBIsPassThrough(dxmt::dxbc::BasicBlock *bb) {
+  using namespace dxmt::dxbc;
+  if (bb->instructions.any(patterns{
+        [](InstNop &) { return false; }, [](InstMov &mov) { return false; },
+        [](InstEmit &) { return false; }, [](InstCut &) { return false; },
+        [](auto &) { return true; }
+      }))
+    return false;
+
+  return std::visit(
+    patterns{
+      [](dxmt::dxbc::BasicBlockReturn) { return true; },
+      [](dxmt::dxbc::BasicBlockUnconditionalBranch uncond) {
+        return CheckGSBBIsPassThrough(uncond.target);
+      },
+      [](auto) { return false; }
+    },
+    bb->target
+  );
+}
+
+bool CheckGSSignatureIsPassThrough(
+  microsoft::CSignatureParser &input, microsoft::CSignatureParser5 &output,
+  MTL_GEOMETRY_SHADER_PASS_THROUGH &data
+) {
+  using namespace microsoft;
+
+  data.RenderTargetArrayIndexComponent = 255;
+  data.RenderTargetArrayIndexReg = 255;
+  data.ViewportArrayIndexComponent = 255;
+  data.ViewportArrayIndexReg = 255;
+
+  if (output.NumStreams() > 1) {
+    return false;
+  }
+  if (output.RasterizedStream()) {
+    return false;
+  }
+
+  const D3D11_SIGNATURE_PARAMETER *input_parameters, *output_parameters;
+  input.GetParameters(&input_parameters);
+  output.Signature(0)->GetParameters(&output_parameters);
+  size_t num_input, num_output;
+  num_input = input.GetNumParameters();
+  num_output = output.Signature(0)->GetNumParameters();
+  if (num_output > num_input) {
+    // at least it is a non-trivial shader that generates new data
+    return false;
+  }
+  bool has_match_record;
+  for (unsigned i = 0; i < num_output; i++) {
+    has_match_record = false;
+    const D3D11_SIGNATURE_PARAMETER &out = output_parameters[i];
+    for (unsigned j = 0; j < num_input; j++) {
+      const D3D11_SIGNATURE_PARAMETER &in = input_parameters[j];
+      if (out.Register == in.Register && (out.Mask & in.Mask) == out.Mask) {
+        if (out.SystemValue == D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX) {
+          data.RenderTargetArrayIndexReg = out.Register;
+          data.RenderTargetArrayIndexComponent = __builtin_ctz(out.Mask);
+        } else if (out.SystemValue == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX) {
+          data.ViewportArrayIndexReg = out.Register;
+          data.ViewportArrayIndexComponent = __builtin_ctz(out.Mask);
+        } else {
+          if (out.SemanticIndex != in.SemanticIndex) {
+            return false;
+          }
+          if (strcasecmp(out.SemanticName, in.SemanticName)) {
+            return false;
+          }
+        }
+        has_match_record = true;
+        break;
+      }
+    }
+    if (!has_match_record) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+AIRCONV_API int SM50Initialize(
+  const void *pBytecode, size_t BytecodeSize, sm50_shader_t *ppShader,
+  MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
+) {
+  using namespace microsoft;
+  using namespace dxmt::dxbc;
+  using namespace dxmt::air;
+  using namespace dxmt::shader::common;
+  if (ppError) {
+    *ppError = nullptr;
+  }
+  auto errorObj = new SM50ErrorInternal();
+  llvm::raw_svector_ostream errorOut(errorObj->buf);
+
+  if (ppShader == nullptr) {
+    errorOut << "ppShader can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  CDXBCParser DXBCParser;
+  if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
+    errorOut << "Invalid DXBC bytecode\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  UINT codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShaderEx);
+  if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
+    codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShader);
+  }
+  if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
+    errorOut << "Invalid DXBC bytecode: shader blob not found\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+  const void *codeBlob = DXBCParser.GetBlob(codeBlobIdx);
+
+  CShaderToken *ShaderCode = (CShaderToken *)(BYTE *)codeBlob;
+  // 1. Collect information about the shader.
+  D3D10ShaderBinary::CShaderCodeParser CodeParser(ShaderCode);
+  CSignatureParser inputParser;
+  if (DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
+    errorOut << "Invalid DXBC bytecode: input signature not found\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+  CSignatureParser5 outputParser;
+  if (DXBCGetOutputSignature(pBytecode, &outputParser) != S_OK) {
+    errorOut << "Invalid DXBC bytecode: output signature not found\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  auto sm50_shader = new SM50ShaderInternal();
+  sm50_shader->shader_type = CodeParser.ShaderType();
+  auto shader_info = &(sm50_shader->shader_info);
+
+  {
+    const D3D11_SIGNATURE_PARAMETER *parameters;
+    outputParser.RastSignature()->GetParameters(&parameters);
+    for (unsigned i = 0; i < outputParser.RastSignature()->GetNumParameters(); i++) {
+      Signature signature(parameters[i]);
+      if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER &&
+          signature.semanticName() == "sv_target" &&
+          signature.semanticIndex() < 32) {
+        sm50_shader->pso_valid_output_reg_mask |=
+            1u << signature.semanticIndex();
+      }
+      sm50_shader->output_signature.push_back(std::move(signature));
+    }
+  }
+
+  sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
+  auto &binding_table = shader_info->binding_table;
+  auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
+
+  uint16_t binding_cbuffer_mask = 0;
+  uint16_t binding_sampler_mask = 0;
+  uint64_t binding_uav_mask = 0;
+  uint64_t binding_srv_hi_mask = 0;
+  uint64_t binding_srv_lo_mask = 0;
+
+  // In bindless-mirror mode each per-resource argument-buffer field is a typed
+  // array sized to the heap-mirror capacity (see BINDLESS-ABI.md). Must match
+  // RebuildArgumentBindingTables exactly so StructurePtrOffset == arg_index.
+  const uint32_t mirror_n = gBindlessMirror ? kBindlessMirrorCapacity : 1;
+  for (auto &[range_id, cbv] : shader_info->cbufferMap) {
+    // TODO: abstract SM 5.0 binding
+    auto binding_slot = cbv.range.binding_slot;
+    if (gBindlessMirror) {
+      const auto arg_index = binding_table_cbuffer.DefineBuffer(
+        "cb" + std::to_string(range_id), AddressSpace::constant,
+        MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, binding_slot),
+        std::nullopt, mirror_n
+      );
+      cbv.arg_index = arg_index;
+      sm50_shader->args_reflection_cbuffer.push_back({
+        .Type = SM50BindingType::ConstantBuffer,
+        .SM50BindingSlot = binding_slot,
+        .Flags =
+          MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
+        .StructurePtrOffset = arg_index,
+        .RegisterSpace = cbv.range.space,
+        .RegisterLowerBound = cbv.range.lower_bound,
+        .RegisterCount = cbv.range.size ? cbv.range.size : 1,
+        .CBufferSizeInVec4 = cbv.size_in_vec4,
+      });
+      if (binding_slot < 16)
+        binding_cbuffer_mask |= (1 << binding_slot);
+      continue;
+    }
+    const uint32_t range_size = cbuffer_binding_range_size(cbv.range);
+    cbv.arg_index = binding_table_cbuffer.Size();
+    for (uint32_t i = 0; i < range_size; i++) {
+      const uint32_t slot = binding_slot + i;
+      const uint32_t register_lower = cbv.range.lower_bound + i;
+      const auto name = range_size == 1
+                          ? "cb" + std::to_string(range_id)
+                          : "cb" + std::to_string(range_id) + "_" + std::to_string(i);
+      const auto arg_index = binding_table_cbuffer.DefineBuffer(
+        name, AddressSpace::constant, MemoryAccess::read, msl_uint4,
+        GetArgumentIndex(SM50BindingType::ConstantBuffer, slot)
+      );
+      sm50_shader->args_reflection_cbuffer.push_back({
+        .Type = SM50BindingType::ConstantBuffer,
+        .SM50BindingSlot = slot,
+        .Flags =
+          MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
+        .StructurePtrOffset = arg_index,
+        .RegisterSpace = cbv.range.space,
+        .RegisterLowerBound = register_lower,
+        .RegisterCount = 1,
+        .CBufferSizeInVec4 = cbv.size_in_vec4,
+      });
+      if (slot < 16)
+        binding_cbuffer_mask |= (1 << slot);
+    }
+  }
+  for (auto &[range_id, sampler] : shader_info->samplerMap) {
+    // TODO: abstract SM 5.0 binding
+    auto binding_slot = sampler.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, binding_slot);
+    sampler.arg_index = binding_table.DefineSampler(
+      "s" + std::to_string(range_id), attr_index, mirror_n);
+    sampler.arg_cube_index = binding_table.DefineSampler(
+      "cube_s" + std::to_string(range_id), attr_index + 1, mirror_n);
+    sampler.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_s" + std::to_string(range_id), attr_index + 2, mirror_n
+    );
+    sm50_shader->args_reflection.push_back({
+      .Type = SM50BindingType::Sampler,
+      .SM50BindingSlot = binding_slot,
+      .Flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0,
+      .StructurePtrOffset = sampler.arg_index,
+      .RegisterSpace = sampler.range.space,
+      .RegisterLowerBound = sampler.range.lower_bound,
+      .RegisterCount = sampler.range.size ? sampler.range.size : 1,
+    });
+    if (binding_slot < 16)
+      binding_sampler_mask |= (1 << binding_slot);
+  }
+  for (auto &[range_id, srv] : shader_info->srvMap) {
+    auto binding_slot = srv.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
+    if (srv.resource_type != ResourceType::NonApplicable) {
+      // TODO: abstract SM 5.0 binding
+      auto access = srv.sampled ? MemoryAccess::sample : MemoryAccess::read;
+      auto texture_kind = to_air_resource_type(srv.resource_type, srv.compared);
+      auto scaler_type = to_air_scaler_type(srv.scaler_type);
+      const uint32_t tex_array =
+        gBindlessMirror
+          ? mirror_n
+          : ((gBindlessMirrorTextureSrvPrototype &&
+              srv.resource_type == ResourceType::Texture2D)
+               ? 16
+               : 1);
+      srv.arg_index = binding_table.DefineTexture(
+        "t" + std::to_string(range_id), texture_kind, access, scaler_type,
+        attr_index, std::nullopt, tex_array
+      );
+    } else {
+      srv.arg_index = binding_table.DefineBuffer(
+        "t" + std::to_string(range_id),
+        AddressSpace::device, // it needs to be `device` since `constant` has
+                              // size and alignment restriction
+        MemoryAccess::read, msl_uint, attr_index, std::nullopt, mirror_n
+      );
+    }
+    srv.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_t" + std::to_string(range_id), attr_index + 1, mirror_n
+    );
+    MTL_SM50_SHADER_ARGUMENT_FLAG flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0;
+    if (srv.resource_type == ResourceType::NonApplicable) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_ELEMENT_WIDTH |
+               MTL_SM50_SHADER_ARGUMENT_BUFFER;
+    } else if (srv.resource_type == ResourceType::TextureBuffer) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET |
+               MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+    } else {
+      flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP |
+               MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+      add_texture_argument_flags(flags, srv.resource_type, srv.scaler_type, srv.compared);
+      switch (srv.resource_type) {
+      case ResourceType::Texture1DArray:
+      case ResourceType::Texture2DArray:
+      case ResourceType::Texture2DMultisampledArray:
+      case ResourceType::TextureCubeArray:
+        flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY;
+        break;
+      default:
+        break;
+      }
+    }
+    if (srv.read || srv.sampled || srv.compared) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_READ_ACCESS;
+    }
+    if (srv.requires_typed_sampler)
+      flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_REQUIRES_TYPED_SAMPLER;
+    sm50_shader->args_reflection.push_back({
+      .Type = SM50BindingType::SRV,
+      .SM50BindingSlot = binding_slot,
+      .Flags = flags,
+      .StructurePtrOffset = srv.arg_index,
+      .RegisterSpace = srv.range.space,
+      .RegisterLowerBound = srv.range.lower_bound,
+      .RegisterCount = srv.range.size ? srv.range.size : 1,
+    });
+    if (binding_slot < 64) {
+      binding_srv_lo_mask |= (1ULL << binding_slot);
+    } else if (binding_slot < 128) {
+      binding_srv_hi_mask |= (1ULL << (binding_slot - 64));
+    }
+  }
+  for (auto &[range_id, uav] : shader_info->uavMap) {
+    auto access =
+      uav.written ? (uav.read ? MemoryAccess::read_write : MemoryAccess::write)
+                  : MemoryAccess::read;
+    auto binding_slot = uav.range.binding_slot;
+    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, binding_slot);
+    if (uav.resource_type != ResourceType::NonApplicable) {
+      auto texture_kind = to_air_resource_type(uav.resource_type);
+      auto scaler_type = to_air_scaler_type(uav.scaler_type);
+      uav.arg_index = binding_table.DefineTexture(
+        "u" + std::to_string(range_id), texture_kind, access, scaler_type,
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
+      );
+    } else {
+      uav.arg_index = binding_table.DefineBuffer(
+        "u" + std::to_string(range_id), AddressSpace::device, access, msl_uint,
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt,
+        mirror_n
+      );
+    }
+    uav.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_u" + std::to_string(range_id), attr_index + 1, mirror_n
+    );
+    if (uav.with_counter) {
+      uav.arg_counter_index = binding_table.DefineBuffer(
+        "counter" + std::to_string(range_id), AddressSpace::device,
+        MemoryAccess::read_write, msl_uint, attr_index + 2,
+        uav.rasterizer_order ? std::optional(1) : std::nullopt, mirror_n
+      );
+    }
+    MTL_SM50_SHADER_ARGUMENT_FLAG flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0;
+    if (uav.resource_type == ResourceType::NonApplicable) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_ELEMENT_WIDTH |
+               MTL_SM50_SHADER_ARGUMENT_BUFFER;
+    } else if (uav.resource_type == ResourceType::TextureBuffer) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET |
+               MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+    } else {
+      flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP |
+               MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+      add_texture_argument_flags(flags, uav.resource_type, uav.scaler_type, false);
+      switch (uav.resource_type) {
+      case ResourceType::Texture1DArray:
+      case ResourceType::Texture2DArray:
+      case ResourceType::Texture2DMultisampledArray:
+      case ResourceType::TextureCubeArray:
+        flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY;
+        break;
+      default:
+        break;
+      }
+    }
+    if (uav.read) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_READ_ACCESS;
+    }
+    if (uav.written) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS;
+    }
+    if (uav.with_counter) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER;
+    }
+    sm50_shader->args_reflection.push_back({
+      .Type = SM50BindingType::UAV,
+      .SM50BindingSlot = binding_slot,
+      .Flags = flags,
+      .StructurePtrOffset = uav.arg_index,
+      .RegisterSpace = uav.range.space,
+      .RegisterLowerBound = uav.range.lower_bound,
+      .RegisterCount = uav.range.size ? uav.range.size : 1,
+    });
+    if (binding_slot < 64)
+      binding_uav_mask |= (1ULL << binding_slot);
+  }
+
+  if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER &&
+      !sm50_shader->shader_info.no_control_point_phase_passthrough) {
+    assert(sm50_shader->max_output_register == 0);
+    uint32_t num_input_params = inputParser.GetNumParameters();
+    D3D11_SIGNATURE_PARAMETER const * params;
+    inputParser.GetParameters(&params);
+    for (unsigned i = 0; i < num_input_params; i++) {
+      sm50_shader->max_output_register = std::max(
+        sm50_shader->max_output_register,
+        params[i].Register + 1
+      );
+    }
+  }
+
+  if (pRefl) {
+    pRefl->ConstanttBufferTableBindIndex =
+      (!gBindlessMirror && sm50_shader->args_reflection_cbuffer.size() > 0)
+        ? 29
+        : ~0u;
+    pRefl->ArgumentBufferBindIndex =
+      sm50_shader->args_reflection.size() > 0 ? 30 : ~0u;
+    pRefl->ConstantBufferSlotMask = binding_cbuffer_mask;
+    pRefl->SamplerSlotMask = binding_sampler_mask;
+    pRefl->SRVSlotMaskHi = binding_srv_hi_mask;
+    pRefl->SRVSlotMaskLo = binding_srv_lo_mask;
+    pRefl->UAVSlotMask = binding_uav_mask;
+    pRefl->NumConstantBuffers = sm50_shader->args_reflection_cbuffer.size();
+    pRefl->NumArguments = sm50_shader->args_reflection.size();
+    if (sm50_shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER) {
+      pRefl->ThreadgroupSize[0] = sm50_shader->threadgroup_size[0];
+      pRefl->ThreadgroupSize[1] = sm50_shader->threadgroup_size[1];
+      pRefl->ThreadgroupSize[2] = sm50_shader->threadgroup_size[2];
+    }
+    if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER) {
+      auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
+      if (threads_per_patch > 32) {
+        errorOut << "Threadgroup size of tessellation pipeline is too large.";
+        *ppError = (sm50_error_t)errorObj;
+        return 1;
+      }
+      auto patch_per_group = 32 / threads_per_patch;
+      float max_tesselation_factor = sm50_shader->max_tesselation_factor;
+
+      while (estimate_payload_size(sm50_shader, max_tesselation_factor, patch_per_group) > 16384) {
+        if (patch_per_group == 1) {
+          if (max_tesselation_factor > 1.0f) {
+            max_tesselation_factor = std::max(max_tesselation_factor - 2.0f, 1.0f);
+          } else {
+            errorOut << "Payload size of tessellation pipeline is too large.";
+            *ppError = (sm50_error_t)errorObj;
+            return 1;
+          }
+        } else {
+          patch_per_group = patch_per_group >> 1;
+        }
+      }
+      sm50_shader->hull_maximum_threads_per_patch = 32 / patch_per_group;
+      sm50_shader->max_tesselation_factor = max_tesselation_factor;
+
+      pRefl->ThreadsPerPatch = sm50_shader->hull_maximum_threads_per_patch;
+      pRefl->Tessellator = {
+        .Partition = sm50_shader->tessellation_partition,
+        .MaxFactor = sm50_shader->max_tesselation_factor,
+        .OutputPrimitive = (MTL_TESSELLATOR_OUTPUT_PRIMITIVE
+        )sm50_shader->tessellator_output_primitive,
+      };
+    }
+    if (sm50_shader->shader_type == microsoft::D3D11_SB_DOMAIN_SHADER) {
+      uint32_t max_potential_tess_factor = 1;
+
+      for (int tess_factor = 1; tess_factor <= 64; tess_factor++) {
+        auto x = estimate_mesh_size(sm50_shader, tess_factor);
+        if (x > 32768)
+          break;
+        max_potential_tess_factor = tess_factor;
+      }
+
+      pRefl->PostTessellator = {.MaxPotentialTessFactor = max_potential_tess_factor};
+    }
+    if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER) {
+      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask ||
+          binding_srv_hi_mask || binding_srv_lo_mask ||
+          !CheckGSBBIsPassThrough(sm50_shader->entry())) {
+        pRefl->GeometryShader.GSPassThrough = ~0u;
+      } else {
+        CheckGSSignatureIsPassThrough(
+          inputParser, outputParser, pRefl->GeometryShader.Data
+        );
+      }
+      pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
+    }
+    if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
+      pRefl->PSValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
+    }
+    pRefl->NumOutputElement = sm50_shader->max_output_register;
+    pRefl->ArgumentTableQwords = binding_table.Size();
+  }
+
+  *ppShader = sm50_shader;
+  return 0;
+};
+
+AIRCONV_API void SM50GetArgumentsInfo(
+  sm50_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
+  struct MTL_SM50_SHADER_ARGUMENT *pArguments
+) {
+  auto sm50_shader = (dxmt::dxbc::SM50ShaderInternal *)pShader;
+  if (pConstantBuffers && sm50_shader->args_reflection_cbuffer.size())
+    memcpy(
+      pConstantBuffers, sm50_shader->args_reflection_cbuffer.data(),
+      sm50_shader->args_reflection_cbuffer.size() *
+        sizeof(struct MTL_SM50_SHADER_ARGUMENT)
+    );
+  if (pArguments && sm50_shader->args_reflection.size())
+    memcpy(
+      pArguments, sm50_shader->args_reflection.data(),
+      sm50_shader->args_reflection.size() *
+        sizeof(struct MTL_SM50_SHADER_ARGUMENT)
+    );
+}
+
+AIRCONV_API void SM50Destroy(sm50_shader_t pShader) {
+  delete (dxmt::dxbc::SM50ShaderInternal *)pShader;
+}
+
+AIRCONV_API int SM50Compile(
+  sm50_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
+  const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+) {
+  using namespace llvm;
+  using namespace dxmt;
+
+  if (ppError) {
+    *ppError = nullptr;
+  }
+  auto errorObj = new SM50ErrorInternal();
+  llvm::raw_svector_ostream errorOut(errorObj->buf);
+  if (ppBitcode == nullptr) {
+    errorOut << "ppBitcode can not be null\0";
+    if (ppError)
+      *ppError = (sm50_error_t)errorObj;
+    else
+      delete errorObj;
+    return 1;
+  }
+
+  SM50ShaderAbiScope shader_abi_scope(pArgs);
+
+  LLVMContext context;
+
+  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+
+  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
+
+  auto pModule = std::make_unique<Module>("shader.air", context);
+  initializeModule(*pModule);
+
+  if (auto err = dxmt::dxbc::convertDXBC(
+        pShader, FunctionName, context, *pModule, pArgs
+      )) {
+    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+      errorOut << u.msg;
+    });
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  if (shader_info.use_msad)
+    linkMSAD(*pModule);
+  if (shader_info.use_samplepos)
+    linkSamplePos(*pModule);
+
+  runOptimizationPasses(*pModule);
+
+  // Serialize AIR
+  auto compiled = new SM50CompiledBitcodeInternal();
+
+  raw_svector_ostream OS(compiled->vec);
+
+  metallib::MetallibWriter writer;
+
+  writer.Write(*pModule, OS);
+
+  pModule.reset();
+
+  *ppBitcode = (sm50_bitcode_t)compiled;
+  return 0;
+}
+
+AIRCONV_API int SM50CompileTessellationPipelineHull(
+  sm50_shader_t pVertexShader, sm50_shader_t pHullShader,
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pHullShaderArgs,
+  const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+) {
+  using namespace llvm;
+  using namespace dxmt;
+
+  if (ppError) {
+    *ppError = nullptr;
+  }
+  auto errorObj = new SM50ErrorInternal();
+  llvm::raw_svector_ostream errorOut(errorObj->buf);
+  if (ppBitcode == nullptr) {
+    errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  SM50ShaderAbiScope shader_abi_scope(pHullShaderArgs);
+  LLVMContext context;
+
+  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+
+  auto &shader_info =
+    ((dxmt::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
+
+  auto pModule = std::make_unique<Module>("shader.air", context);
+  initializeModule(*pModule);
+
+  if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
+        (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
+        FunctionName, context, *pModule, pHullShaderArgs
+      )) {
+    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+      errorOut << u.msg;
+    });
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  if (shader_info.use_msad)
+    linkMSAD(*pModule);
+  if (shader_info.use_samplepos)
+    linkSamplePos(*pModule);
+  linkTessellation(*pModule);
+
+  runOptimizationPasses(*pModule);
+
+  // Serialize AIR
+  auto compiled = new SM50CompiledBitcodeInternal();
+
+  raw_svector_ostream OS(compiled->vec);
+
+  metallib::MetallibWriter writer;
+
+  writer.Write(*pModule, OS);
+
+  pModule.reset();
+
+  *ppBitcode = (sm50_bitcode_t)compiled;
+  return 0;
+}
+
+AIRCONV_API int SM50CompileTessellationPipelineDomain(
+  sm50_shader_t pHullShader, sm50_shader_t pDomainShader,
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pDomainShaderArgs,
+  const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+) {
+  using namespace llvm;
+  using namespace dxmt;
+
+  if (ppError) {
+    *ppError = nullptr;
+  }
+  auto errorObj = new SM50ErrorInternal();
+  llvm::raw_svector_ostream errorOut(errorObj->buf);
+  if (ppBitcode == nullptr) {
+    errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  SM50ShaderAbiScope shader_abi_scope(pDomainShaderArgs);
+  LLVMContext context;
+
+  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+
+  auto &shader_info =
+    ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
+
+  auto pModule = std::make_unique<Module>("shader.air", context);
+  initializeModule(*pModule);
+
+  if (auto err = dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
+        (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
+        (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule,
+        pDomainShaderArgs
+      )) {
+    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+      errorOut << u.msg;
+    });
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  if (shader_info.use_msad)
+    linkMSAD(*pModule);
+  if (shader_info.use_samplepos)
+    linkSamplePos(*pModule);
+  linkTessellation(*pModule);
+  
+  runOptimizationPasses(*pModule);
+
+  // Serialize AIR
+  auto compiled = new SM50CompiledBitcodeInternal();
+
+  raw_svector_ostream OS(compiled->vec);
+
+  metallib::MetallibWriter writer;
+
+  writer.Write(*pModule, OS);
+
+  pModule.reset();
+
+  *ppBitcode = (sm50_bitcode_t)compiled;
+  return 0;
+}
+
+AIRCONV_API int SM50CompileGeometryPipelineVertex(
+  sm50_shader_t pVertexShader, sm50_shader_t pGeometryShader,
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pVertexShaderArgs,
+  const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+) {
+  using namespace llvm;
+  using namespace dxmt;
+
+  if (ppError) {
+    *ppError = nullptr;
+  }
+  auto errorObj = new SM50ErrorInternal();
+  llvm::raw_svector_ostream errorOut(errorObj->buf);
+  if (ppBitcode == nullptr) {
+    errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  SM50ShaderAbiScope shader_abi_scope(pVertexShaderArgs);
+  LLVMContext context;
+
+  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+
+  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
+
+  auto pModule = std::make_unique<Module>("shader.air", context);
+  initializeModule(*pModule);
+
+  if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
+        (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
+        (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
+        pVertexShaderArgs
+      )) {
+    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+      errorOut << u.msg;
+    });
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  if (shader_info.use_msad)
+    linkMSAD(*pModule);
+  if (shader_info.use_samplepos)
+    linkSamplePos(*pModule);
+
+  runOptimizationPasses(*pModule);
+
+  // Serialize AIR
+  auto compiled = new SM50CompiledBitcodeInternal();
+
+  raw_svector_ostream OS(compiled->vec);
+
+  metallib::MetallibWriter writer;
+
+  writer.Write(*pModule, OS);
+
+  pModule.reset();
+
+  *ppBitcode = (sm50_bitcode_t)compiled;
+  return 0;
+}
+
+AIRCONV_API int SM50CompileGeometryPipelineGeometry(
+  sm50_shader_t pVertexShader, sm50_shader_t pGeometryShader,
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pGeometryShaderArgs,
+  const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+) {
+  using namespace llvm;
+  using namespace dxmt;
+
+  if (ppError) {
+    *ppError = nullptr;
+  }
+  auto errorObj = new SM50ErrorInternal();
+  llvm::raw_svector_ostream errorOut(errorObj->buf);
+  if (ppBitcode == nullptr) {
+    errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  SM50ShaderAbiScope shader_abi_scope(pGeometryShaderArgs);
+  LLVMContext context;
+
+  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+
+  auto &shader_info =
+    ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
+
+  auto pModule = std::make_unique<Module>("shader.air", context);
+  initializeModule(*pModule);
+
+  if (auto err = dxmt::dxbc::convert_dxbc_geometry_shader(
+        (dxbc::SM50ShaderInternal *)pGeometryShader, FunctionName,
+        (dxbc::SM50ShaderInternal *)pVertexShader, context, *pModule,
+        pGeometryShaderArgs
+      )) {
+    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+      errorOut << u.msg;
+    });
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  if (shader_info.use_msad)
+    linkMSAD(*pModule);
+  if (shader_info.use_samplepos)
+    linkSamplePos(*pModule);
+  
+  runOptimizationPasses(*pModule);
+
+  // Serialize AIR
+  auto compiled = new SM50CompiledBitcodeInternal();
+
+  raw_svector_ostream OS(compiled->vec);
+
+  metallib::MetallibWriter writer;
+
+  writer.Write(*pModule, OS);
+
+  pModule.reset();
+
+  *ppBitcode = (sm50_bitcode_t)compiled;
+  return 0;
+}
+
+AIRCONV_API void SM50GetCompiledBitcode(
+  sm50_bitcode_t pBitcode, SM50_COMPILED_BITCODE *pData
+) {
+  auto pBitcodeInternal = (SM50CompiledBitcodeInternal *)pBitcode;
+  pData->Data = pBitcodeInternal->vec.data();
+  pData->Size = pBitcodeInternal->vec.size();
+}
+
+AIRCONV_API void SM50DestroyBitcode(sm50_bitcode_t pBitcode) {
+  auto pBitcodeInternal = (SM50CompiledBitcodeInternal *)pBitcode;
+  delete pBitcodeInternal;
+}
+
+AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_t BufferSize) {
+  // A compile can fail before any error object exists (for example when the
+  // marshalling thunks cannot build the argument chain, or when the unixcall
+  // itself fails). Callers pass the nullptr error handle straight through, so
+  // treat it as an empty message instead of dereferencing it. SM50FreeError
+  // already accepts nullptr.
+  if (pBuffer == nullptr || BufferSize == 0)
+    return 0;
+  if (pError == nullptr) {
+    pBuffer[0] = '\0';
+    return 0;
+  }
+  auto pInternal = (SM50ErrorInternal *)pError;
+  auto str_len = std::min(pInternal->buf.size(), BufferSize - 1);
+  memcpy(pBuffer, pInternal->buf.data(), str_len);
+  pBuffer[str_len] = '\0';
+  return str_len;
+}
+
+AIRCONV_API void SM50FreeError(sm50_error_t pError) {
+  if (pError == nullptr)
+    return;
+  auto pInternal = (SM50ErrorInternal *)pError;
+  delete pInternal;
+}

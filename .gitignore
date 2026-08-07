@@ -16,4 +16,6 @@ ref.sh
 *.js
 *.test
 releases
-prefixes
+prefixesbuild.w32
+build.w64
+dist/

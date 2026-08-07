@@ -1,0 +1,1283 @@
+#include "dxmt_command.hpp"
+#include "Metal.hpp"
+#include "dxmt_context.hpp"
+#include "dxmt_format.hpp"
+#include "log/log.hpp"
+#include <cfloat>
+
+#include "dxmt_command.h"
+
+#define CREATE_PIPELINE(function_name, member_name)                                                                     \
+  auto member_name##_function = library.newFunction(#function_name);                                                    \
+  if (!member_name##_function) {                                                                                        \
+    ERR("Failed to find internal compute function: " #function_name);                                                   \
+    abort();                                                                                                            \
+  }                                                                                                                     \
+  member_name##_pipeline = device.newComputePipelineState(member_name##_function, error);                               \
+  if (error) {                                                                                                          \
+    ERR("Failed to create internal compute pipeline: " #function_name ": ", error.description().getUTF8String());       \
+    abort();                                                                                                            \
+  }
+
+namespace dxmt {
+
+InternalCommandLibrary::InternalCommandLibrary(WMT::Device device) {
+  WMT::Reference<WMT::Error> error;
+  library_ = device.newLibrary(dxmt_command, dxmt_command_len, error);
+
+  if (error) {
+    ERR("Failed to create internal command library: ", error.description().getUTF8String());
+    abort();
+  }
+};
+
+EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx): ctx(ctx) {
+  auto pool = WMT::MakeAutoreleasePool();
+
+  auto library = lib.getLibrary();
+
+  WMT::Reference<WMT::Error> error;
+
+  CREATE_PIPELINE(clear_texture_1d_uint, clear_texture_1d_uint);
+  CREATE_PIPELINE(clear_texture_1d_array_uint, clear_texture_1d_array_uint);
+  CREATE_PIPELINE(clear_texture_2d_uint, clear_texture_2d_uint);
+  CREATE_PIPELINE(clear_texture_2d_array_uint, clear_texture_2d_array_uint);
+  CREATE_PIPELINE(clear_texture_3d_uint, clear_texture_3d_uint);
+  CREATE_PIPELINE(clear_texture_buffer_uint, clear_texture_buffer_uint);
+  CREATE_PIPELINE(clear_buffer_uint, clear_buffer_uint);
+  CREATE_PIPELINE(clear_texture_1d_float, clear_texture_1d_float);
+  CREATE_PIPELINE(clear_texture_1d_array_float, clear_texture_1d_array_float);
+  CREATE_PIPELINE(clear_texture_2d_float, clear_texture_2d_float);
+  CREATE_PIPELINE(clear_texture_2d_array_float, clear_texture_2d_array_float);
+  CREATE_PIPELINE(clear_texture_3d_float, clear_texture_3d_float);
+  CREATE_PIPELINE(clear_texture_buffer_float, clear_texture_buffer_float);
+  CREATE_PIPELINE(cs_prepare_counted_indirect_args, cs_prepare_counted_indirect_args);
+  CREATE_PIPELINE(cs_copy_buffer_bytes, copy_buffer_bytes);
+  CREATE_PIPELINE(copy_buffer_regions, copy_buffer_regions);
+
+
+  auto gs_draw_arguments_marshal_vs = library.newFunction("gs_draw_arguments_marshal");
+  {
+    WMTRenderPipelineInfo gs_marshal_pipeline;
+    WMT::InitializeRenderPipelineInfo(gs_marshal_pipeline);
+    gs_marshal_pipeline.vertex_function = gs_draw_arguments_marshal_vs;
+    gs_marshal_pipeline.rasterization_enabled = false;
+    gs_draw_arguments_marshal = device.newRenderPipelineState(gs_marshal_pipeline, error);
+  }
+
+  auto ts_draw_arguments_marshal_vs = library.newFunction("ts_draw_arguments_marshal");
+  {
+    WMTRenderPipelineInfo ts_marshal_pipeline;
+    WMT::InitializeRenderPipelineInfo(ts_marshal_pipeline);
+    ts_marshal_pipeline.vertex_function = ts_draw_arguments_marshal_vs;
+    ts_marshal_pipeline.rasterization_enabled = false;
+    ts_draw_arguments_marshal = device.newRenderPipelineState(ts_marshal_pipeline, error);
+  }
+}
+
+void
+EmulatedCommandContext::setComputePipelineState(WMT::ComputePipelineState state, const WMTSize &threadgroup_size) {
+  auto &cmd = ctx.encodeComputeCommand<wmtcmd_compute_setpso>();
+  cmd.type = WMTComputeCommandSetPSO;
+  cmd.pso = state;
+  cmd.threadgroup_size = threadgroup_size;
+}
+
+void EmulatedCommandContext::dispatchThreads(const WMTSize &grid_size) {
+  auto &cmd = ctx.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  cmd.type = WMTComputeCommandDispatchThreads;
+  cmd.size = grid_size;
+}
+
+void
+EmulatedCommandContext::setComputeBuffer(WMT::Buffer buffer, uint64_t offset, uint8_t index) {
+  auto &cmd = ctx.encodeComputeCommand<wmtcmd_compute_setbuffer>();
+  cmd.type = WMTComputeCommandSetBuffer;
+  cmd.buffer = buffer;
+  cmd.offset = offset;
+  cmd.index = index;
+}
+
+void
+EmulatedCommandContext::setComputeTexture(WMT::Texture texture, uint8_t index) {
+  auto &cmd = ctx.encodeComputeCommand<wmtcmd_compute_settexture>();
+  cmd.type = WMTComputeCommandSetTexture;
+  cmd.texture = texture;
+  cmd.index = index;
+}
+
+void
+EmulatedCommandContext::setComputeBytes(const void *buf, uint64_t length, uint8_t index) {
+  auto &cmd = ctx.encodeComputeCommand<wmtcmd_compute_setbytes>();
+  cmd.type = WMTComputeCommandSetBytes;
+  void *temp = ctx.allocate_cpu_heap(length, 8);
+  memcpy(temp, buf, length);
+  cmd.bytes.set(temp);
+  cmd.length = length;
+  cmd.index = index;
+}
+
+void
+EmulatedCommandContext::PrepareCountedIndirectArguments(
+    WMT::Buffer count_buffer, uint64_t count_offset, WMT::Buffer src,
+    uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset,
+    uint32_t argument_bytes, uint32_t command_index) {
+  struct Metadata {
+    uint32_t argument_bytes;
+    uint32_t command_index;
+  } metadata = {argument_bytes, command_index};
+
+  setComputePipelineState(cs_prepare_counted_indirect_args_pipeline, {32, 1, 1});
+  setComputeBuffer(count_buffer, count_offset, 0);
+  setComputeBuffer(src, src_offset, 1);
+  setComputeBuffer(dst, dst_offset, 2);
+  setComputeBytes(&metadata, sizeof(metadata), 3);
+  dispatchThreads({argument_bytes, 1, 1});
+}
+
+ClearRenderTargetContext::ClearRenderTargetContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_clear_ = library.newFunction("vs_clear_rt");
+  fs_clear_depth_ = library.newFunction("fs_clear_rt_depth");
+  fs_clear_float_ = library.newFunction("fs_clear_rt_float");
+  fs_clear_sint_ = library.newFunction("fs_clear_rt_sint");
+  fs_clear_uint_ = library.newFunction("fs_clear_rt_uint");
+
+  for (unsigned flags = 0; flags < depth_stencil_states_.size(); ++flags) {
+    WMTDepthStencilInfo ds_info = {};
+    ds_info.depth_compare_function = WMTCompareFunctionAlways;
+    ds_info.depth_write_enabled = flags & 1;
+    ds_info.front_stencil.enabled = flags & 2;
+    ds_info.back_stencil.enabled = flags & 2;
+    for (auto *stencil : {&ds_info.front_stencil, &ds_info.back_stencil}) {
+      stencil->stencil_compare_function = WMTCompareFunctionAlways;
+      stencil->depth_stencil_pass_op = WMTStencilOperationReplace;
+      stencil->depth_fail_op = WMTStencilOperationReplace;
+      stencil->stencil_fail_op = WMTStencilOperationReplace;
+      stencil->write_mask = 0xff;
+    }
+    depth_stencil_states_[flags] = device.newDepthStencilState(ds_info);
+  }
+}
+
+void
+ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view,
+                                unsigned depth_stencil_flags,
+                                uint8_t stencil, uint32_t depth_plane,
+                                uint32_t render_target_array_length) {
+  assert(!clearing_texture_);
+
+  WMT::Reference<WMT::Error> err;
+
+  auto format = texture->pixelFormat(view);
+  auto dsv_flag = DepthStencilPlanarFlags(format);
+  if (dsv_flag && !depth_stencil_flags)
+    depth_stencil_flags = 1;
+  depth_stencil_flags &= dsv_flag;
+
+  // enforce array render target for now
+  view = texture->checkViewUseArray(view, true);
+
+  auto sample_count = texture->sampleCount();
+  uint64_t pso_key = (uint64_t(format) << 8) | (uint64_t(sample_count) & 0xffu);
+  if (!pso_cache_.contains(pso_key)) {
+    WMTRenderPipelineInfo pipeline_info;
+    WMT::InitializeRenderPipelineInfo(pipeline_info);
+    pipeline_info.raster_sample_count = sample_count;
+    pipeline_info.vertex_function = vs_clear_;
+    if (dsv_flag) {
+      pipeline_info.fragment_function = fs_clear_depth_;
+      pipeline_info.depth_pixel_format = format;
+      if (dsv_flag & 2)
+        pipeline_info.stencil_pixel_format = format;
+    } else if (IsIntegerFormat(format)) {
+      pipeline_info.colors[0].pixel_format = format;
+      if (MTLGetUnsignedIntegerFormat(format) == format) {
+        pipeline_info.fragment_function = fs_clear_uint_;
+      } else {
+        pipeline_info.fragment_function = fs_clear_sint_;
+      }
+    } else {
+      pipeline_info.colors[0].pixel_format = format;
+      pipeline_info.fragment_function = fs_clear_float_;
+    }
+    pipeline_info.rasterization_enabled = true;
+    pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+    auto pso = device_.newRenderPipelineState(pipeline_info, err);
+    if (pso == nullptr) {
+      ERR("Failed to create ClearRenderTarget PSO of format ", format, ": ", err.description().getUTF8String());
+    }
+    pso_cache_.emplace(pso_key, std::move(pso));
+  }
+
+  WMT::RenderPipelineState pso = pso_cache_.at(pso_key);
+
+  if (!pso)
+    return;
+
+  auto width = texture->width(view);
+  auto height = texture->height(view);
+  if (!render_target_array_length)
+    render_target_array_length = texture->arrayLength(view);
+  auto &pass_info = *ctx_.startRenderPass(
+      dsv_flag, dsv_flag & ~depth_stencil_flags, 1, 0);
+
+  if (dsv_flag) {
+    if (dsv_flag & 1) {
+      auto &depth = pass_info.depth;
+      depth.attachment = ctx_.access<PipelineStage::Pixel>(
+          texture, view, ResourceAccess::Write);
+      depth.depth_plane = depth_plane;
+      depth.load_action = WMTLoadActionLoad;
+      depth.store_action = WMTStoreActionStore;
+    }
+    if (dsv_flag & 2) {
+      auto &stencil_attachment = pass_info.stencil;
+      stencil_attachment.attachment = ctx_.access<PipelineStage::Pixel>(
+          texture, view, ResourceAccess::Write);
+      stencil_attachment.depth_plane = depth_plane;
+      stencil_attachment.load_action = WMTLoadActionLoad;
+      stencil_attachment.store_action = WMTStoreActionStore;
+    }
+  } else {
+    auto &color = pass_info.colors[0];
+    color.attachment = ctx_.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
+    color.depth_plane = depth_plane;
+    color.load_action = WMTLoadActionLoad;
+    color.store_action = WMTStoreActionStore;
+  }
+
+  pass_info.render_target_width = width;
+  pass_info.render_target_height = height;
+  pass_info.render_target_array_length = render_target_array_length;
+  pass_info.default_raster_sample_count = texture->sampleCount();
+
+  auto &setpso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+  setpso.type = WMTRenderCommandSetPSO;
+  setpso.pso = pso;
+
+  auto &setvp = ctx_.encodeRenderCommand<wmtcmd_render_setviewport>();
+  setvp.type = WMTRenderCommandSetViewport;
+  setvp.viewport = {0.0, 0.0, (double)width, (double)height, 0.0, 1.0};
+
+  auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
+  setdsso.type = WMTRenderCommandSetDSSO;
+  setdsso.dsso = depth_stencil_states_[depth_stencil_flags].handle;
+  setdsso.stencil_ref = stencil;
+
+  clearing_texture_ = std::move(texture);
+  clearing_texture_view_ = view;
+}
+
+void
+ClearRenderTargetContext::clear(
+    uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, const std::array<float, 4> &color
+) {
+  if (!clearing_texture_)
+    return;
+  auto &setscr = ctx_.encodeRenderCommand<wmtcmd_render_setscissorrect>();
+  setscr.type = WMTRenderCommandSetScissorRect;
+  setscr.scissor_rect = {offset_x, offset_y, width, height};
+
+  auto &setcolor = ctx_.encodeRenderCommand<wmtcmd_render_setbytes>();
+  setcolor.type = WMTRenderCommandSetFragmentBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(color), 16);
+  memcpy(temp, color.data(), sizeof(color));
+  setcolor.bytes.set(temp);
+  setcolor.length = sizeof(color);
+  setcolor.index = 0;
+
+  auto &draw = ctx_.encodeRenderCommand<wmtcmd_render_draw>();
+  draw.type = WMTRenderCommandDraw;
+  draw.primitive_type = WMTPrimitiveTypeTriangle;
+  draw.vertex_start = 0;
+  draw.vertex_count = 3;
+  draw.base_instance = 0;
+  draw.instance_count = ctx_.currentRenderEncoder()->render_target_array_length;
+}
+
+void
+ClearRenderTargetContext::end() {
+  if (!clearing_texture_)
+    return;
+  ctx_.endPass();
+  clearing_texture_ = nullptr;
+  clearing_texture_view_ = 0;
+};
+
+ResolveTextureContext::ResolveTextureContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_resolve_ = library.newFunction("vs_resolve_msaa");
+  fs_resolve_average_ = library.newFunction("fs_resolve_msaa_average");
+  fs_resolve_min_ = library.newFunction("fs_resolve_msaa_min");
+  fs_resolve_max_ = library.newFunction("fs_resolve_msaa_max");
+  fs_resolve_depth_ = library.newFunction("fs_resolve_msaa_depth");
+}
+
+WMT::RenderPipelineState
+ResolveTextureContext::getPSO(WMTPixelFormat format, ResolveTextureMode mode) {
+  PSOKey key = {format, mode};
+  auto cached = psos_.find(key);
+  if (cached != psos_.end())
+    return cached->second;
+
+  WMT::Function fs = {};
+  switch (mode) {
+  case ResolveTextureMode::Average:
+    fs = fs_resolve_average_;
+    break;
+  case ResolveTextureMode::Min:
+    fs = fs_resolve_min_;
+    break;
+  case ResolveTextureMode::Max:
+    fs = fs_resolve_max_;
+    break;
+  case ResolveTextureMode::DepthPoint:
+    fs = fs_resolve_depth_;
+    break;
+  }
+
+  WMTRenderPipelineInfo info;
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = vs_resolve_;
+  info.fragment_function = fs;
+  // The depth resolve writes a depth attachment and carries no colour target; the
+  // colour modes are the reverse.
+  if (mode == ResolveTextureMode::DepthPoint)
+    info.depth_pixel_format = format;
+  else
+    info.colors[0].pixel_format = format;
+  info.rasterization_enabled = true;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  WMT::Reference<WMT::Error> error;
+  auto pso = device_.newRenderPipelineState(info, error);
+  if (!pso) {
+    WARN("Failed to create ResolveTexture PSO of format ", format, ": ",
+         error ? error.description().getUTF8String() : "unknown error");
+  }
+  auto [entry, _] = psos_.emplace(key, std::move(pso));
+  return entry->second;
+}
+
+void
+ResolveTextureContext::resolve(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    ResolveTextureMode mode, std::optional<WMTScissorRect> src_rect,
+    WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), mode);
+  if (!pso)
+    return;
+  ctx_.resolveTexture(
+      std::move(src), src_view, std::move(dst), dst_view, pso,
+      src_rect, dst_origin, resolve_size);
+}
+
+void
+ResolveTextureContext::resolveDepth(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), ResolveTextureMode::DepthPoint);
+  if (!pso)
+    return;
+  ctx_.resolveDepthTexture(
+      std::move(src), src_view, std::move(dst), dst_view, pso,
+      src_rect, dst_origin, resolve_size);
+}
+
+StretchBlitContext::StretchBlitContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_blit_ = library.newFunction("vs_blit_quad");
+  fs_blit_ = library.newFunction("fs_blit_quad");
+}
+
+WMT::RenderPipelineState
+StretchBlitContext::getPSO(WMTPixelFormat dst_format, uint32_t sample_count) {
+  uint64_t key = (uint64_t(dst_format) << 8) | (uint64_t(sample_count) & 0xffu);
+  auto cached = psos_.find(key);
+  if (cached != psos_.end())
+    return cached->second;
+
+  WMTRenderPipelineInfo info;
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = vs_blit_;
+  info.fragment_function = fs_blit_;
+  info.colors[0].pixel_format = dst_format;
+  // Matches the render pass raster count (D3-O2 single -> multisample broadcast);
+  // 1 for the common single-sample destination, unchanged.
+  info.raster_sample_count = sample_count;
+  info.rasterization_enabled = true;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  WMT::Reference<WMT::Error> error;
+  auto pso = device_.newRenderPipelineState(info, error);
+  if (!pso) {
+    WARN("Failed to create StretchBlit PSO of format ", dst_format, " samples ", sample_count, ": ",
+         error ? error.description().getUTF8String() : "unknown error");
+  }
+  auto [entry, _] = psos_.emplace(key, std::move(pso));
+  return entry->second;
+}
+
+WMT::SamplerState
+StretchBlitContext::getSampler(Filter filter) {
+  auto &slot = (filter == Filter::Linear) ? sampler_linear_ : sampler_point_;
+  if (slot)
+    return slot;
+  WMTSamplerInfo info{};
+  info.min_filter = (filter == Filter::Linear)
+                        ? WMTSamplerMinMagFilterLinear
+                        : WMTSamplerMinMagFilterNearest;
+  info.mag_filter = info.min_filter;
+  info.mip_filter = WMTSamplerMipFilterNotMipmapped;
+  info.r_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.s_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.t_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.border_color = WMTSamplerBorderColorTransparentBlack;
+  info.compare_function = WMTCompareFunctionNever;
+  info.lod_min_clamp = 0.0f;
+  info.lod_max_clamp = FLT_MAX;
+  info.max_anisotroy = 1;
+  info.normalized_coords = true;
+  info.lod_average = false;
+  info.support_argument_buffers = false;
+  slot = device_.newSamplerState(info);
+  return slot;
+}
+
+void
+StretchBlitContext::blit(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    Filter filter, WMTOrigin src_origin, WMTSize src_size,
+    WMTOrigin dst_origin, WMTSize dst_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), dst->sampleCount());
+  if (!pso)
+    return;
+  auto sampler = getSampler(filter);
+  if (!sampler)
+    return;
+  ctx_.stretchBlit(
+      std::move(src), src_view, std::move(dst), dst_view, pso, sampler,
+      src_origin, src_size, dst_origin, dst_size);
+}
+
+DepthStencilBlitContext::DepthStencilBlitContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  WMT::Reference<WMT::Error> err;
+
+  auto library = lib.getLibrary();
+
+  auto vs_copy = library.newFunction("vs_present_quad");
+  auto fs_copy_d24s8 = library.newFunction("fs_copy_from_buffer_d24s8");
+  auto fs_copy_d32s8 = library.newFunction("fs_copy_from_buffer_d32s8");
+  auto fs_copy_depth_r32 = library.newFunction("fs_copy_depth_from_buffer_r32_float");
+  auto fs_copy_stencil_r8 = library.newFunction("fs_copy_stencil_from_buffer_r8_uint");
+  auto cs_copy_d24s8 = library.newFunction("cs_copy_to_buffer_d24s8");
+  auto cs_copy_d32s8 = library.newFunction("cs_copy_to_buffer_d32s8");
+  auto cs_copy_depth_to_buffer_r32 = library.newFunction("cs_copy_depth_to_buffer_r32_float");
+  auto cs_copy_stencil_to_buffer_r8 = library.newFunction("cs_copy_stencil_to_buffer_r8_uint");
+
+  WMTRenderPipelineInfo pipeline_info;
+  WMT::InitializeRenderPipelineInfo(pipeline_info);
+  pipeline_info.vertex_function = vs_copy;
+  pipeline_info.depth_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
+  pipeline_info.stencil_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
+  pipeline_info.rasterization_enabled = true;
+  pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  pipeline_info.fragment_function = fs_copy_d24s8;
+  pso_copy_d24s8_ = device_.newRenderPipelineState(pipeline_info, err);
+
+  pipeline_info.fragment_function = fs_copy_d32s8;
+  pso_copy_d32s8_ = device_.newRenderPipelineState(pipeline_info, err);
+
+  pipeline_info.fragment_function = fs_copy_depth_r32;
+  pipeline_info.depth_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
+  pipeline_info.stencil_pixel_format = WMTPixelFormatInvalid;
+  pso_copy_depth_from_buffer_r32_ =
+      device_.newRenderPipelineState(pipeline_info, err);
+
+  pipeline_info.fragment_function = fs_copy_stencil_r8;
+  pipeline_info.depth_pixel_format = WMTPixelFormatInvalid;
+  pipeline_info.stencil_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
+  pso_copy_stencil_from_buffer_r8_ =
+      device_.newRenderPipelineState(pipeline_info, err);
+
+  WMTDepthStencilInfo ds_info;
+  ds_info.front_stencil.enabled = true;
+  ds_info.front_stencil.stencil_compare_function = WMTCompareFunctionAlways;
+  ds_info.front_stencil.depth_stencil_pass_op = WMTStencilOperationReplace;
+  ds_info.front_stencil.depth_fail_op = WMTStencilOperationReplace;
+  ds_info.front_stencil.stencil_fail_op = WMTStencilOperationReplace;
+  ds_info.front_stencil.write_mask = 0xFF;
+  ds_info.front_stencil.read_mask = 0;
+  ds_info.back_stencil.enabled = true;
+  ds_info.back_stencil.stencil_compare_function = WMTCompareFunctionAlways;
+  ds_info.back_stencil.depth_stencil_pass_op = WMTStencilOperationReplace;
+  ds_info.back_stencil.depth_fail_op = WMTStencilOperationReplace;
+  ds_info.back_stencil.stencil_fail_op = WMTStencilOperationReplace;
+  ds_info.back_stencil.write_mask = 0xFF;
+  ds_info.back_stencil.read_mask = 0;
+  ds_info.depth_compare_function = WMTCompareFunctionAlways;
+  ds_info.depth_write_enabled = true;
+
+  depth_stencil_state_ = device.newDepthStencilState(ds_info);
+
+  pso_copy_to_buffer_d24s8_ = device_.newComputePipelineState(cs_copy_d24s8, err);
+  pso_copy_to_buffer_d32s8_ = device_.newComputePipelineState(cs_copy_d32s8, err);
+  pso_copy_depth_to_buffer_r32_ = device_.newComputePipelineState(cs_copy_depth_to_buffer_r32, err);
+  pso_copy_stencil_to_buffer_r8_ = device_.newComputePipelineState(cs_copy_stencil_to_buffer_r8, err);
+}
+
+struct linear_texture_desc {
+  uint32_t bytes_per_row;
+  uint32_t bytes_per_image;
+  uint32_t origin[2];
+};
+
+void
+DepthStencilBlitContext::copyFromBuffer(
+    const Rc<Buffer> &src, uint64_t src_offset, uint64_t src_length, uint32_t bytes_per_row, uint32_t bytes_per_image,
+    const Rc<Texture> &depth_stencil, uint32_t level, uint32_t slice, bool from_d24s8
+) {
+
+  TextureViewDescriptor view_desc;
+  switch (depth_stencil->textureType()) {
+  case WMTTextureType2D:
+  case WMTTextureType2DArray:
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+    view_desc.type = WMTTextureType2D;
+    break;
+  /*
+  - 1d is already mapped to 2d
+  - staging texture cannot be multisampled
+  */
+  default:
+    return;
+  }
+  view_desc.format = depth_stencil->pixelFormat();
+  view_desc.firstMiplevel = level;
+  view_desc.miplevelCount = 1;
+  view_desc.firstArraySlice = slice;
+  view_desc.arraySize = 1;
+  view_desc.intendedUsage = WMTTextureUsageRenderTarget;
+
+  auto view = depth_stencil->createView(view_desc);
+
+  auto width = depth_stencil->width(view);
+  auto height = depth_stencil->height(view);
+  auto &pass_info = *ctx_.startRenderPass(0b11, 0, 0, 0);
+  auto &depth = pass_info.depth;
+  depth.attachment = ctx_.access<PipelineStage::Pixel>(depth_stencil, view, ResourceAccess::Write);
+  depth.depth_plane = 0;
+  depth.level = level;
+  depth.slice = slice;
+  depth.load_action = WMTLoadActionLoad;
+  depth.store_action = WMTStoreActionStore;
+
+  auto &stencil = pass_info.stencil;
+  stencil.attachment = ctx_.access<PipelineStage::Pixel>(depth_stencil, view, ResourceAccess::Write);
+  stencil.depth_plane = 0;
+  stencil.level = level;
+  stencil.slice = slice;
+  stencil.load_action = WMTLoadActionLoad;
+  stencil.store_action = WMTStoreActionStore;
+
+  pass_info.render_target_width = width;
+  pass_info.render_target_height = height;
+  pass_info.render_target_array_length = 0;
+  pass_info.default_raster_sample_count = depth_stencil->sampleCount();
+
+  auto &setpso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+  setpso.type = WMTRenderCommandSetPSO;
+  setpso.pso = from_d24s8 ? pso_copy_d24s8_: pso_copy_d32s8_;
+
+  auto &setvp = ctx_.encodeRenderCommand<wmtcmd_render_setviewport>();
+  setvp.type = WMTRenderCommandSetViewport;
+  setvp.viewport = {0.0, 0.0, (double)width, (double)height, 0.0, 1.0};
+
+  auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
+  setdsso.type = WMTRenderCommandSetDSSO;
+  setdsso.dsso = depth_stencil_state_.handle;
+  setdsso.stencil_ref = 0;
+
+  auto [src_buffer, src_sub_offset] =
+      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length,
+                                        ResourceAccess::Read);
+
+  auto &setbuf = ctx_.encodeRenderCommand<wmtcmd_render_setbuffer>();
+  setbuf.type = WMTRenderCommandSetFragmentBuffer;
+  setbuf.buffer = src_buffer->buffer();
+  setbuf.index = 0;
+  setbuf.offset = src_offset + src_sub_offset;
+
+  linear_texture_desc desc{bytes_per_row, bytes_per_image};
+  auto &setdesc = ctx_.encodeRenderCommand<wmtcmd_render_setbytes>();
+  setdesc.type = WMTRenderCommandSetFragmentBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(desc), 16);
+  memcpy(temp, &desc, sizeof(desc));
+  setdesc.bytes.set(temp);
+  setdesc.length = sizeof(desc);
+  setdesc.index = 1;
+
+  auto &draw = ctx_.encodeRenderCommand<wmtcmd_render_draw>();
+  draw.type = WMTRenderCommandDraw;
+  draw.primitive_type = WMTPrimitiveTypeTriangle;
+  draw.vertex_start = 0;
+  draw.vertex_count = 3;
+  draw.base_instance = 0;
+  draw.instance_count = 1;
+
+  ctx_.endPass();
+}
+
+void
+DepthStencilBlitContext::copyFromTexture(
+    const Rc<Texture> &depth_stencil, uint32_t level, uint32_t slice, const Rc<Buffer> &dst, uint64_t dst_offset,
+    uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool to_d24s8
+) {
+  TextureViewDescriptor view_desc;
+  switch (depth_stencil->textureType()) {
+  case WMTTextureType2D:
+  case WMTTextureType2DArray:
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+    view_desc.type = WMTTextureType2D;
+    break;
+  /*
+  - 1d is already mapped to 2d
+  - staging texture cannot be multisampled
+  */
+  default:
+    return;
+  }
+  view_desc.format = WMTPixelFormatDepth32Float_Stencil8;
+  view_desc.firstMiplevel = level;
+  view_desc.miplevelCount = 1;
+  view_desc.firstArraySlice = slice;
+  view_desc.arraySize = 1;
+  view_desc.intendedUsage = WMTTextureUsageRenderTarget;
+  auto depth_view = depth_stencil->createView(view_desc);
+
+  view_desc.format = WMTPixelFormatX32G8X32;
+  auto stencil_view = depth_stencil->createView(view_desc);
+
+  ctx_.startComputePass(0);
+  auto tex_depth = ctx_.access(depth_stencil, depth_view, ResourceAccess::Read).texture;
+  auto tex_stencil = ctx_.access(depth_stencil, stencil_view, ResourceAccess::Read).texture;
+  auto [dst_, dst_sub_offset] = ctx_.access(dst, dst_offset, dst_length, ResourceAccess::Write);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = to_d24s8 ? pso_copy_to_buffer_d24s8_ : pso_copy_to_buffer_d32s8_;
+  setpso.threadgroup_size = {8, 4, 1};
+
+  auto &setdepth = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setdepth.type = WMTComputeCommandSetTexture;
+  setdepth.texture = tex_depth;
+  setdepth.index = 0;
+
+  auto &setstencil = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setstencil.type = WMTComputeCommandSetTexture;
+  setstencil.texture = tex_stencil;
+  setstencil.index = 1;
+
+  auto &setbuf = ctx_.encodeComputeCommand<wmtcmd_compute_setbuffer>();
+  setbuf.type = WMTComputeCommandSetBuffer;
+  setbuf.buffer = dst_->buffer();
+  setbuf.index = 0;
+  setbuf.offset = dst_offset + dst_sub_offset;
+
+  linear_texture_desc desc{bytes_per_row, bytes_per_image};
+  auto &setdesc = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+  setdesc.type = WMTComputeCommandSetBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(desc), 16);
+  memcpy(temp, &desc, sizeof(desc));
+  setdesc.bytes.set(temp);
+  setdesc.length = sizeof(desc);
+  setdesc.index = 1;
+
+  auto width = depth_stencil->width(depth_view);
+  auto height = depth_stencil->height(depth_view);
+  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {width, height, 1};
+
+  ctx_.endPass();
+}
+
+void
+DepthStencilBlitContext::copyPlaneToBuffer(
+    const Rc<Texture> &src, TextureViewKey src_view, Rc<Buffer> dst, uint64_t dst_offset,
+    uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool stencil_plane,
+    WMTOrigin origin, WMTSize size
+) {
+  ctx_.startComputePass(0);
+  auto src_texture = ctx_.access(src, src_view, ResourceAccess::Read).texture;
+  auto [dst_buffer, dst_sub_offset] = ctx_.access(dst, dst_offset, dst_length, ResourceAccess::Write);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = stencil_plane ? pso_copy_stencil_to_buffer_r8_ : pso_copy_depth_to_buffer_r32_;
+  setpso.threadgroup_size = {8, 8, 1};
+
+  auto &setsrc = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setsrc.type = WMTComputeCommandSetTexture;
+  setsrc.texture = src_texture;
+  setsrc.index = 0;
+
+  linear_texture_desc desc{bytes_per_row, bytes_per_image,
+                           {uint32_t(origin.x), uint32_t(origin.y)}};
+  auto &setdesc = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+  setdesc.type = WMTComputeCommandSetBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(desc), 16);
+  memcpy(temp, &desc, sizeof(desc));
+  setdesc.bytes.set(temp);
+  setdesc.length = sizeof(desc);
+  setdesc.index = 1;
+
+  auto &setbuf = ctx_.encodeComputeCommand<wmtcmd_compute_setbuffer>();
+  setbuf.type = WMTComputeCommandSetBuffer;
+  setbuf.buffer = dst_buffer->buffer();
+  setbuf.index = 0;
+  setbuf.offset = dst_offset + dst_sub_offset;
+
+  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {size.width, size.height, 1};
+
+  ctx_.endPass();
+}
+
+void
+DepthStencilBlitContext::copyPlaneFromBuffer(
+    const Rc<Buffer> &src, uint64_t src_offset, uint64_t src_length,
+    uint32_t bytes_per_row, uint32_t bytes_per_image, const Rc<Texture> &dst,
+    uint32_t level, uint32_t slice, bool stencil_plane, WMTOrigin origin,
+    WMTSize size
+) {
+  TextureViewDescriptor view_desc = {};
+  switch (dst->textureType()) {
+  case WMTTextureType2D:
+  case WMTTextureType2DArray:
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+    view_desc.type = WMTTextureType2D;
+    break;
+  default:
+    return;
+  }
+  view_desc.format = dst->pixelFormat();
+  view_desc.firstMiplevel = level;
+  view_desc.miplevelCount = 1;
+  view_desc.firstArraySlice = slice;
+  view_desc.arraySize = 1;
+  view_desc.intendedUsage = WMTTextureUsageRenderTarget;
+
+  auto view = dst->createView(view_desc);
+  auto &pass_info = *ctx_.startRenderPass(stencil_plane ? 0b10 : 0b01, 0, 0, 0);
+  pass_info.render_target_width = origin.x + size.width;
+  pass_info.render_target_height = origin.y + size.height;
+  pass_info.render_target_array_length = 1;
+  pass_info.default_raster_sample_count = dst->sampleCount();
+
+  if (stencil_plane) {
+    auto &stencil = pass_info.stencil;
+    stencil.attachment =
+        ctx_.access<PipelineStage::Pixel>(dst, view, ResourceAccess::Write);
+    stencil.depth_plane = 0;
+    stencil.level = level;
+    stencil.slice = slice;
+    stencil.load_action = WMTLoadActionLoad;
+    stencil.store_action = WMTStoreActionStore;
+  } else {
+    auto &depth = pass_info.depth;
+    depth.attachment =
+        ctx_.access<PipelineStage::Pixel>(dst, view, ResourceAccess::Write);
+    depth.depth_plane = 0;
+    depth.level = level;
+    depth.slice = slice;
+    depth.load_action = WMTLoadActionLoad;
+    depth.store_action = WMTStoreActionStore;
+  }
+
+  auto &setpso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+  setpso.type = WMTRenderCommandSetPSO;
+  setpso.pso = stencil_plane ? pso_copy_stencil_from_buffer_r8_
+                             : pso_copy_depth_from_buffer_r32_;
+
+  auto &setvp = ctx_.encodeRenderCommand<wmtcmd_render_setviewport>();
+  setvp.type = WMTRenderCommandSetViewport;
+  setvp.viewport = {double(origin.x), double(origin.y), double(size.width),
+                    double(size.height), 0.0, 1.0};
+
+  auto &setscissor = ctx_.encodeRenderCommand<wmtcmd_render_setscissorrect>();
+  setscissor.type = WMTRenderCommandSetScissorRect;
+  setscissor.scissor_rect = {origin.x, origin.y, size.width, size.height};
+
+  auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
+  setdsso.type = WMTRenderCommandSetDSSO;
+  setdsso.dsso = depth_stencil_state_.handle;
+  setdsso.stencil_ref = 0;
+
+  auto [src_buffer, src_sub_offset] =
+      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length,
+                                        ResourceAccess::Read);
+
+  auto &setbuf = ctx_.encodeRenderCommand<wmtcmd_render_setbuffer>();
+  setbuf.type = WMTRenderCommandSetFragmentBuffer;
+  setbuf.buffer = src_buffer->buffer();
+  setbuf.index = 0;
+  setbuf.offset = src_offset + src_sub_offset;
+
+  linear_texture_desc desc{bytes_per_row, bytes_per_image,
+                           {uint32_t(origin.x), uint32_t(origin.y)}};
+  auto &setdesc = ctx_.encodeRenderCommand<wmtcmd_render_setbytes>();
+  setdesc.type = WMTRenderCommandSetFragmentBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(desc), 16);
+  memcpy(temp, &desc, sizeof(desc));
+  setdesc.bytes.set(temp);
+  setdesc.length = sizeof(desc);
+  setdesc.index = 1;
+
+  auto &draw = ctx_.encodeRenderCommand<wmtcmd_render_draw>();
+  draw.type = WMTRenderCommandDraw;
+  draw.primitive_type = WMTPrimitiveTypeTriangle;
+  draw.vertex_start = 0;
+  draw.vertex_count = 3;
+  draw.base_instance = 0;
+  draw.instance_count = 1;
+
+  ctx_.endPass();
+}
+
+ClearResourceKernelContext::ClearResourceKernelContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  auto create_pipeline = [&](const char *name) {
+    auto function = library.newFunction(name);
+    if (!function) {
+      ERR("Failed to find internal clear function: ", name);
+      abort();
+    }
+    WMT::Reference<WMT::Error> error;
+    auto pipeline = device_.newComputePipelineState(function, error);
+    if (!pipeline) {
+      ERR("Failed to create internal clear pipeline: ", name, ": ",
+          error ? error.description().getUTF8String() : "unknown error");
+      abort();
+    }
+    return pipeline;
+  };
+  cs_clear_buffer_uint_ = create_pipeline("cs_clear_buffer_uint");
+  cs_clear_buffer_float_ = create_pipeline("cs_clear_buffer_float");
+  cs_clear_tbuffer_uint_ = create_pipeline("cs_clear_tbuffer_uint");
+  cs_clear_tbuffer_float_ = create_pipeline("cs_clear_tbuffer_float");
+  cs_clear_texture2d_uint_ = create_pipeline("cs_clear_texture2d_uint");
+  cs_clear_texture2d_float_ = create_pipeline("cs_clear_texture2d_float");
+  cs_clear_texture2d_array_uint_ =
+      create_pipeline("cs_clear_texture2d_array_uint");
+  cs_clear_texture2d_array_float_ =
+      create_pipeline("cs_clear_texture2d_array_float");
+  cs_clear_texture3d_uint_ = create_pipeline("cs_clear_texture3d_uint");
+  cs_clear_texture3d_float_ = create_pipeline("cs_clear_texture3d_float");
+}
+
+void
+ClearResourceKernelContext::setClearColor(const std::array<float, 4> &color, bool is_integer) {
+  if (is_integer) {
+    meta_temp_.color_u32[0] = uint32_t(std::max(color[0], 0.0f));
+    meta_temp_.color_u32[1] = uint32_t(std::max(color[1], 0.0f));
+    meta_temp_.color_u32[2] = uint32_t(std::max(color[2], 0.0f));
+    meta_temp_.color_u32[3] = uint32_t(std::max(color[3], 0.0f));
+  } else {
+    meta_temp_.color_f32[0] = color[0];
+    meta_temp_.color_f32[1] = color[1];
+    meta_temp_.color_f32[2] = color[2];
+    meta_temp_.color_f32[3] = color[3];
+  }
+};
+
+void
+ClearResourceKernelContext::setClearColor(const std::array<uint32_t, 4> &color) {
+  meta_temp_.color_u32[0] = color[0];
+  meta_temp_.color_u32[1] = color[1];
+  meta_temp_.color_u32[2] = color[2];
+  meta_temp_.color_u32[3] = color[3];
+};
+
+void
+ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Texture> texture, TextureViewKey view) {
+
+  clearing_texture_ = texture;
+  clearing_view_ = view;
+  ctx_.startComputePass(0);
+
+  bool is_integer = IsIntegerFormat(texture->pixelFormat(view));
+
+  setClearColor(color, is_integer);
+
+  bool is_array = false;
+  bool is_3d = false;
+  switch (texture->textureType(view)) {
+  case WMTTextureType1DArray:
+  case WMTTextureType2DArray:
+    is_array = true;
+    dispatch_depth_ = texture->arrayLength(view);
+    break;
+  case WMTTextureType3D:
+    is_3d = true;
+    clearing_3d_ = true;
+    dispatch_depth_ = std::max(texture->depth() >> view.mip_start, 1u);
+    break;
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+  case WMTTextureType2DMultisample:
+  case WMTTextureType2DMultisampleArray:
+    // not a valid clear target
+    return;
+  default:
+    break;
+  }
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = is_integer
+                   ? (is_3d ? cs_clear_texture3d_uint_
+                            : (is_array ? cs_clear_texture2d_array_uint_
+                                        : cs_clear_texture2d_uint_))
+                   : (is_3d ? cs_clear_texture3d_float_
+                            : (is_array ? cs_clear_texture2d_array_float_
+                                        : cs_clear_texture2d_float_));
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Texture> texture, TextureViewKey view) {
+
+  clearing_texture_ = texture;
+  clearing_view_ = view;
+  ctx_.startComputePass(0);
+
+  setClearColor(color);
+
+  bool is_array = false;
+  bool is_3d = false;
+  switch (texture->textureType(view)) {
+  case WMTTextureType1DArray:
+  case WMTTextureType2DArray:
+    is_array = true;
+    dispatch_depth_ = texture->arrayLength(view);
+    break;
+  case WMTTextureType3D:
+    is_3d = true;
+    clearing_3d_ = true;
+    dispatch_depth_ = std::max(texture->depth() >> view.mip_start, 1u);
+    break;
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+  case WMTTextureType2DMultisample:
+  case WMTTextureType2DMultisampleArray:
+    return;
+  default:
+    break;
+  }
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = is_3d ? cs_clear_texture3d_uint_
+                     : (is_array ? cs_clear_texture2d_array_uint_
+                                 : cs_clear_texture2d_uint_);
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, BufferViewKey view) {
+
+  clearing_buffer_ = buffer;
+  clearing_view_ = view;
+  ctx_.startComputePass(0);
+
+  bool is_integer = IsIntegerFormat(buffer->pixelFormat(view));
+
+  setClearColor(color, is_integer);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = is_integer ? cs_clear_tbuffer_uint_ : cs_clear_tbuffer_float_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, BufferViewKey view) {
+
+  clearing_buffer_ = buffer;
+  clearing_view_ = view;
+  ctx_.startComputePass(0);
+
+  setClearColor(color);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = cs_clear_tbuffer_uint_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer) {
+
+  clearing_buffer_ = buffer;
+  clearing_view_.reset();
+  ctx_.startComputePass(0);
+
+  setClearColor(color, raw_buffer_is_integer);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = raw_buffer_is_integer ? cs_clear_buffer_uint_ : cs_clear_buffer_float_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::begin(const std::array<uint32_t, 4> &color, Rc<Buffer> buffer, bool) {
+
+  clearing_buffer_ = buffer;
+  clearing_view_.reset();
+  ctx_.startComputePass(0);
+
+  setClearColor(color);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = cs_clear_buffer_uint_;
+  setpso.threadgroup_size = {32, 1, 1};
+}
+
+void
+ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height) {
+  meta_temp_.offset[0] = offset_x;
+  meta_temp_.offset[1] = offset_y;
+  meta_temp_.size[0] = width;
+  meta_temp_.size[1] = height;
+
+  // `clearing_view_` is engaged next to every assignment that makes
+  // `clearing_texture_` non-null (begin() overloads at dxmt_command.cpp:828-829
+  // and 874-875) and end() clears both together (dxmt_command.cpp:1059-1061),
+  // so `clearing_texture_` alone used to be treated as proof that the view is
+  // there. That proof is a class invariant spread over three member functions,
+  // which no flow-sensitive reader of clear() can reconstruct, and it is not
+  // even airtight: the raw-buffer begin() overloads
+  // (dxmt_command.cpp:945-946, 960-961) reset the view without resetting
+  // `clearing_texture_`, so a begin(texture)/begin(buffer) pair that skipped
+  // end() would dereference an empty optional here. Testing both makes the
+  // texture branch self-evidently safe and routes that mispaired case to the
+  // buffer branch, which is the resource actually being cleared.
+  if (clearing_texture_ && clearing_view_) {
+    auto &dst_ = ctx_.access(clearing_texture_, *clearing_view_, ResourceAccess::Write);
+    auto &settex = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+    settex.type = WMTComputeCommandSetTexture;
+    settex.texture = dst_.texture;
+    settex.index = 0;
+  } else if (clearing_buffer_) {
+    if (clearing_view_) {
+      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, *clearing_view_, ResourceAccess::Write);
+      auto &settexbuf = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+      settexbuf.type = WMTComputeCommandSetTexture;
+      settexbuf.texture = dst_.texture;
+      settexbuf.index = 0;
+      meta_temp_.offset[0] += dst_sub_offset;
+    } else {
+      const uint32_t byte_offset = offset_x * sizeof(uint32_t);
+      const uint32_t byte_length = width * sizeof(uint32_t);
+      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, byte_offset, byte_length, ResourceAccess::Write);
+      auto &setbuf = ctx_.encodeComputeCommand<wmtcmd_compute_setbuffer>();
+      setbuf.type = WMTComputeCommandSetBuffer;
+      setbuf.buffer = dst_->buffer();
+      setbuf.index = 0;
+      setbuf.offset = dst_sub_offset + byte_offset;
+      meta_temp_.offset[0] = 0;
+    }
+  } else {
+    return;
+  }
+
+  auto &setmeta = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+  setmeta.type = WMTComputeCommandSetBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(meta_temp_), 16);
+  memcpy(temp, &meta_temp_, sizeof(meta_temp_));
+  setmeta.bytes.set(temp);
+  setmeta.length = sizeof(meta_temp_);
+  setmeta.index = 1;
+
+  if (clearing_3d_) {
+    const std::array<uint32_t, 2> depth_range = {dispatch_z_offset_,
+                                                 dispatch_depth_};
+    auto &setdepth = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+    setdepth.type = WMTComputeCommandSetBytes;
+    void *depth_temp = ctx_.allocate_cpu_heap(sizeof(depth_range), 16);
+    memcpy(depth_temp, depth_range.data(), sizeof(depth_range));
+    setdepth.bytes.set(depth_temp);
+    setdepth.length = sizeof(depth_range);
+    setdepth.index = 2;
+  }
+
+  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {width, height, dispatch_depth_};
+}
+
+void
+ClearResourceKernelContext::clear3D(uint32_t offset_x, uint32_t offset_y,
+                                    uint32_t offset_z, uint32_t width,
+                                    uint32_t height, uint32_t depth) {
+  dispatch_z_offset_ = offset_z;
+  dispatch_depth_ = depth;
+  clear(offset_x, offset_y, width, height);
+}
+
+void
+ClearResourceKernelContext::end() {
+  if (!clearing_texture_ && !clearing_buffer_)
+    return;
+  ctx_.endPass();
+  clearing_texture_ = nullptr;
+  clearing_buffer_ = nullptr;
+  clearing_view_.reset();
+  dispatch_depth_ = 1;
+  dispatch_z_offset_ = 0;
+  clearing_3d_ = false;
+};
+
+MTLFXMVScaleContext::MTLFXMVScaleContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  WMT::Reference<WMT::Error> err;
+
+  auto library = lib.getLibrary();
+
+  auto cs_ = library.newFunction("cs_downscale_dilated_mv");
+
+  pso_downscale_dilated_mv_ = device_.newComputePipelineState(cs_, err);
+}
+
+struct downscale_dilated_mv_desc {
+  float scale_x;
+  float scale_y;
+};
+
+void
+MTLFXMVScaleContext::dispatch(
+    const Rc<Texture> &dilated, TextureViewKey view_dilated, const Rc<Texture> &downscaled,
+    TextureViewKey view_downscaled, float mv_scale_x, float mv_scale_y
+) {
+  ctx_.startComputePass(0);
+  auto tex_dilated = ctx_.access(dilated, view_dilated, ResourceAccess::Read).texture;
+  auto tex_downscaled = ctx_.access(downscaled, view_downscaled, ResourceAccess::Write).texture;
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = pso_downscale_dilated_mv_;
+  setpso.threadgroup_size = {8, 4, 1};
+
+  auto &setdepth = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setdepth.type = WMTComputeCommandSetTexture;
+  setdepth.texture = tex_dilated;
+  setdepth.index = 0;
+
+  auto &setstencil = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setstencil.type = WMTComputeCommandSetTexture;
+  setstencil.texture = tex_downscaled;
+  setstencil.index = 1;
+
+  downscale_dilated_mv_desc desc{mv_scale_x, mv_scale_y};
+  auto &setdesc = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+  setdesc.type = WMTComputeCommandSetBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(desc), 16);
+  memcpy(temp, &desc, sizeof(desc));
+  setdesc.bytes.set(temp);
+  setdesc.length = sizeof(desc);
+  setdesc.index = 0;
+
+  auto width = downscaled->width(view_downscaled);
+  auto height = downscaled->height(view_downscaled);
+  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {width, height, 1};
+
+  ctx_.endPass();
+}
+
+TileBarrierContext::TileBarrierContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx) :
+    ctx_(ctx),
+    device_(device) {
+  tile_function_ = lib.getLibrary().newFunction("tile_barrier");
+}
+
+void
+TileBarrierContext::dispatch() {
+  if (auto tile_pso = getPSO(ctx_.currentRenderEncoder()->tile_barrier_pso_key)) {
+    auto &cmd_pso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+    cmd_pso.type = WMTRenderCommandSetPSO;
+    cmd_pso.pso = tile_pso;
+
+    auto &cmd_dispatch = ctx_.encodeRenderCommand<wmtcmd_render_dispatch_threads_per_tile>();
+    cmd_dispatch.type = WMTRenderCommandDispatchThreadsPerTile;
+    cmd_dispatch.width = kBarrierTileSize;
+    cmd_dispatch.height = kBarrierTileSize;
+
+    if (auto pso_recover = ctx_.currentRenderEncoder()->last_pso) {
+      auto &cmd_recover = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+      cmd_recover.type = WMTRenderCommandSetPSO;
+      cmd_recover.pso = pso_recover;
+    }
+  }
+}
+
+WMT::RenderPipelineState
+TileBarrierContext::getPSO(TileBarrierPSOKey &key) {
+  auto it = psos_.find(key);
+  if (it != psos_.end())
+    return it->second;
+
+  WMTTileRenderPipelineInfo info;
+  WMT::InitializeTileRenderPipelineInfo(info);
+  memcpy(&info.color_formats, key.color_formats, sizeof(key.color_formats));
+  info.raster_sample_count = key.raster_sample_count;
+  info.tile_function = tile_function_;
+
+  WMT::Reference<WMT::Error> err;
+  auto pso = device_.newRenderPipelineState(info, err);
+
+  if (!pso) {
+    ERR("Failed to create tile PSO: ", err.description().getUTF8String());
+    return {};
+  }
+
+  return psos_.emplace(key, std::move(pso)).first->second;
+}
+
+} // namespace dxmt
