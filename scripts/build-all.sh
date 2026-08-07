@@ -47,6 +47,16 @@ MESON_COMMON=(
   --buildtype release
 )
 
+# d3d9 must NOT carry the "Wine builtin DLL" marker. MacNdCheese loads it as
+# NATIVE (the backend adds a "d3d9=n" override on Apple GPUs), and wine refuses
+# to load a builtin-marked PE as native -- the DLL is found, load_dll returns
+# STATUS_DLL_NOT_FOUND anyway, and the game dies in the loader with c0000135
+# before any of its own code runs. The option defaults to true, so a build dir
+# configured without this looks fine and produces a d3d9 that cannot be loaded.
+D3D9_ONLY=(
+  -Dwine_builtin_dll=false
+)
+
 # Configure once per (tree, arch); reconfigure is a no-op when nothing changed.
 setup() {
   local tree="$1" builddir="$2" crossfile="$3"; shift 3
@@ -68,8 +78,13 @@ build "$ROOT" build.w64
 build "$ROOT" build.w32
 
 echo "==> d3d9-core (GameSir): d3d9, winemetal9"
-setup "$D3D9_CORE" build.w64 build-win64.txt -Denable_nvapi=false -Denable_nvngx=false
-setup "$D3D9_CORE" build.w32 build-win32.txt -Denable_nvapi=false -Denable_nvngx=false
+setup "$D3D9_CORE" build.w64 build-win64.txt -Denable_nvapi=false -Denable_nvngx=false "${D3D9_ONLY[@]}"
+setup "$D3D9_CORE" build.w32 build-win32.txt -Denable_nvapi=false -Denable_nvngx=false "${D3D9_ONLY[@]}"
+# setup() is a no-op on an existing build dir, so an older one keeps whatever it
+# was configured with; re-assert the option every run.
+for b in build.w64 build.w32; do
+  meson configure "$D3D9_CORE/$b" "${D3D9_ONLY[@]}" >/dev/null 2>&1 || true
+done
 build "$D3D9_CORE" build.w64 dxmt-d3d9
 build "$D3D9_CORE" build.w32 dxmt-d3d9
 
