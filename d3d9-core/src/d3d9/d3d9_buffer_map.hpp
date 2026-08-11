@@ -1,22 +1,29 @@
 #pragma once
-
-#include <algorithm>
 #include <cstdint>
 
 #include "d3d9.h"
 
 // Pure map-mode / lock-flag / dirty-range logic for vertex and index
-// buffers, factored out of d3d9_buffer.cpp so the host unit tier can
-// exercise it without a Metal device. References: DXVK
+// buffers, factored out of d3d9_buffer.cpp so it carries no device or Metal
+// include surface. References: DXVK
 // d3d9_common_buffer.h, DXVK d3d9_device.cpp, wined3d buffer.c.
 
 namespace dxmt {
 
-// THE STORAGE CONTRACT, and it admits no exceptions: no pointer this
-// implementation hands the application ever aliases memory the GPU can wire.
-// Every buffer is staged. Lock returns a host mirror we own and Metal has
-// never seen; the allocation a draw reads is GPU-private and is refreshed from
-// that mirror.
+// THE STORAGE CONTRACT: no page the application writes is ever referenced by a
+// command buffer. Every buffer is staged. Lock returns a host mirror we own and
+// Metal has never seen; the allocation a draw reads is Metal-owned, never
+// handed out, and is refreshed from that mirror.
+//
+// The condition is stated in terms of what the GPU USES rather than what Metal
+// has been told about, because that is what the livelock below turns on, and
+// because one path relies on the difference: a texture's MANAGED mirror is
+// wrapped in a Metal buffer at d3d9_texture.cpp ensureMirror so the device
+// backing pool can hold a single reference type. That buffer is written to the
+// texture's fields and never bound, never blitted from or to; uploads go
+// through the ring and readback writes the CPU backing. Wrapping alone does not
+// wire a page. If a future change ever gives the GPU work that reads it, the
+// pages the application writes become wired and this contract is broken.
 //
 // DXVK's DetermineMapMode (d3d9_common_buffer.cpp) sends DEFAULT+DYNAMIC down
 // its allowDirectBufferMapping arm instead, aliasing the Lock pointer onto the
@@ -34,18 +41,17 @@ namespace dxmt {
 //
 // Second, the alternative that would avoid the wrap is unreachable here.
 // Aliasing memory Metal itself allocates is what DXVK effectively does through
-// Vulkan, but Metal never allocates below 4 GB (measured: zero of ten
-// allocations across sizes and storage modes), so a 32-bit guest cannot
+// Vulkan, but Metal allocates above 4 GB in practice, so a 32-bit guest cannot
 // address it. Giving that guest a lock pointer at all requires wrapping pages
 // it can address, which is exactly the livelock. The divergence from DXVK is
 // forced by the address space, not chosen.
 //
-// Staging costs one copy per Lock, which on unified memory is DRAM bandwidth
-// rather than a transfer, and it buys back guest address space: mirrors are
-// GPU-private and cost none, where in-place renames charged it per allocation
-// in flight. Should a native or 64-bit guest ever remove both premises,
-// shared-storage direct mapping becomes the correct answer again and this is
-// the comment to re-examine.
+// Staging costs one copy per refresh, which on unified memory is DRAM
+// bandwidth rather than a transfer, and it buys back guest address space: the
+// allocation a draw reads is Metal-owned and charges none, where in-place
+// renames charged it per allocation in flight. Should a native or 64-bit guest
+// ever remove both premises, shared-storage direct mapping becomes the correct
+// answer again and this is the comment to re-examine.
 
 // Lock-flag sanitisation. The runtime silently drops flags that the
 // pool/usage/device combination does not honour before any of them take
@@ -91,9 +97,10 @@ buffer_lock_updates_dirty(DWORD flags) {
   return !(flags & D3DLOCK_READONLY);
 }
 
-// Nested-lock counter. D3D9 permits nested Lock/Unlock on one buffer; the
-// staged upload fires only when the outer Unlock returns the count to
-// zero. Unlock is clamped so an unbalanced Unlock cannot underflow.
+// Nested-lock counter. D3D9 permits nested Lock/Unlock on one buffer, and only
+// the outer Unlock means the application has stopped writing, which is what the
+// refresh needs to know before it can call the device copy current. Unlock is
+// clamped so an unbalanced one cannot underflow.
 struct D3D9BufferLockCount {
   uint32_t count = 0;
 

@@ -7,6 +7,7 @@
 #include "dxmt_shader_cache.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
+#include <version.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -42,7 +43,7 @@ shader_dump_enabled() {
   return v;
 }
 
-// Optional bytecode-to-disk dump. Empty → disabled. Set to a writable
+// Optional bytecode-to-disk dump. Empty -> disabled. Set to a writable
 // directory path; we write one file per unique bytecode hash, so the
 // session ends with a directory containing every shader the app
 // created.
@@ -217,11 +218,18 @@ log_shader_dump(
 // type disables caching for the call instead of risking a stale hit.
 // DXSO and the generated pair emit one AIR version regardless of the
 // device, so the store instance is pinned rather than device-derived.
-// The epoch joins the shader digest: bump it whenever the DXSO or
-// fixed-function codegen changes the emitted AIR for an unchanged key,
-// or stale entries outlive the change (the db-level version constant
-// only guards the shared store format).
-static constexpr uint32_t kD9ShaderCacheEpoch = 10;
+// The epoch joins the shader digest, for forcing invalidation by hand when a
+// build version alone would not (the db-level version constant only guards the
+// shared store format).
+//
+// It is NOT the primary guard, and must not be relied on as one. The digest
+// also carries DXMT_VERSION, which moves on every commit and dirty build, so a
+// codegen change invalidates the cache whether or not anyone remembers this
+// line. That is deliberate: while the epoch was the only guard it missed two of
+// the three codegen changes that needed it, and the failure is silent and
+// durable, because the cache is keyed by executable and outlives the build that
+// wrote it. d3d12_pipeline.cpp folds the build version for the same reason.
+static constexpr uint32_t kD9ShaderCacheEpoch = 11;
 
 static bool
 hash_dxso_args(Sha1HashState &h, const DXSO_SHADER_COMPILATION_ARGUMENT_DATA *args) {
@@ -360,6 +368,7 @@ compile_dxso_to_function(
     Sha1HashState hs;
     hs.update(static_cast<uint32_t>(0x64397378u)); /* domain tag "d9sx" */
     hs.update(kD9ShaderCacheEpoch);
+    hs.update(DXMT_VERSION, std::strlen(DXMT_VERSION));
     hs.update(byte_code, dwordCount * sizeof(DWORD));
     cache_key.first = hs.final();
     Sha1HashState hv;
@@ -536,6 +545,7 @@ compile_ffp_to_function(
     Sha1HashState hs;
     hs.update(static_cast<uint32_t>(0x64396670u)); /* domain tag "d9fp" */
     hs.update(kD9ShaderCacheEpoch);
+    hs.update(DXMT_VERSION, std::strlen(DXMT_VERSION));
     cache_key.first = hs.final();
     Sha1HashState hv;
     cacheable = hash_dxso_args(hv, reinterpret_cast<DXSO_SHADER_COMPILATION_ARGUMENT_DATA *>(args));
@@ -705,7 +715,7 @@ D3D9FunctionCompileTask::compile(D3D9VsVariant &v) {
   layout.vs_float_const_count = v.module->device()->vertexShaderFloatConstantCount();
 
   // Triage: dump unique layouts under DXMT_DUMP_D9_LAYOUT=1 so we can
-  // see what D3DDECLTYPE → MTLAttributeFormat the host is feeding the
+  // see what D3DDECLTYPE -> MTLAttributeFormat the host is feeding the
   // manual-fetch path. Useful when a class of draws renders wrong and the
   // suspect is a format mismatch inside the layout built from the vertex
   // declaration. One-shot per (shader, fingerprint).
@@ -797,10 +807,10 @@ D3D9FunctionCompileTask::compile(D3D9FfpVsVariant &v) {
   DXSO_SHADER_IA_INPUT_LAYOUT_DATA layout = v.layout;
   layout.elements = v.elements.data();
   return compile_ffp_to_function(
-      v.device, 0, &layout, v.has_diffuse, v.has_texcoord0, v.has_specular, 0, nullptr, v.lighting_key,
-      v.texcoord_mask, v.texcoord_transform_key, v.fog_vertex_mode, v.range_fog, v.point_size, false, v.point_scale,
-      v.vertex_blend, v.texgen_key, v.texcoord_index_key, 0, false, v.point_size_per_vertex, v.decl_has_diffuse, -1,
-      false, 8, false /*emit_sample_mask: VS never emits coverage*/, 0 /*unorm_snap_mask: VS writes no color*/, "vs"
+      v.device, 0, &layout, v.has_diffuse, v.has_texcoord0, v.has_specular, 0, nullptr, v.lighting_key, v.texcoord_mask,
+      v.texcoord_transform_key, v.fog_vertex_mode, v.range_fog, v.point_size, false, v.point_scale, v.vertex_blend,
+      v.texgen_key, v.texcoord_index_key, 0, false, v.point_size_per_vertex, v.decl_has_diffuse, -1, false, 8,
+      false /*emit_sample_mask: VS never emits coverage*/, 0 /*unorm_snap_mask: VS writes no color*/, "vs"
   );
 }
 
@@ -907,8 +917,7 @@ MTLD3D9Device::ffpVertexFunction(
 D3D9CompiledFunction *
 MTLD3D9Device::ffpPixelFunction(
     const uint32_t (*stages)[3], bool specular_enable, bool point_sprite, int fog_mode, bool fog_coord_w,
-    uint32_t alpha_func, uint32_t sampler_kind_key, bool flat_shading, bool emit_sample_mask,
-    uint32_t unorm_snap_mask
+    uint32_t alpha_func, uint32_t sampler_kind_key, bool flat_shading, bool emit_sample_mask, uint32_t unorm_snap_mask
 ) {
   // FNV over the combiner table plus the packed bounded axes. The alpha
   // ref rides the bool-buffer tail (ffp_ps_variant_key drops it), so
@@ -1034,11 +1043,7 @@ MTLD3D9VertexShaderModule::getVariantTask(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA
   // a per-draw uniform at VS buffer 6, so the variant key gains only the
   // single injection bit, so distinct point sizes share one variant rather
   // than minting a cold PSO link per value.
-  // DXVK feeds the size the same way (d3d9_fixed_function.cpp
-  // GetPointSizeInfoVS). The task caches a failure as a null function() too,
-  // so a subsequent draw with the same layout short-circuits here instead of
-  // re-burning the compile path; the pipeline builder treats null as a hard
-  // mismatch.
+  // DXVK feeds the size the same way, as push data rather than a variant.
   uint64_t key = point_size_variant_key(layout_fingerprint(layout), inject_point_size);
   if (auto it = m_variantCache.find(key); it != m_variantCache.end()) {
     // Full-key verify (same discipline as the bytecode module cache): the key
@@ -1205,10 +1210,11 @@ MTLD3D9PixelShaderModule::getVariantTask(
     // compiles a fresh variant instead of returning the wrong one. samp_kinds
     // is a fixed 16-byte array with no padding, so memcmp is safe.
     const auto *v = std::get_if<D3D9PsVariant>(&static_cast<D3D9FunctionCompileTask *>(it->second.get())->input());
-    if (v && v->alpha_test_func == alpha_test_func && std::memcmp(v->samp_kinds, samp_kinds, sizeof(v->samp_kinds)) == 0 &&
-        v->point_sprite == point_sprite && v->fog_mode == fog_mode && v->fog_coord_w == fog_coord_w &&
-        v->dual_source == dual_source && v->flat_shading == flat_shading &&
-        v->emit_sample_mask == emit_sample_mask && v->unorm_snap_mask == unorm_snap_mask)
+    if (v && v->alpha_test_func == alpha_test_func &&
+        std::memcmp(v->samp_kinds, samp_kinds, sizeof(v->samp_kinds)) == 0 && v->point_sprite == point_sprite &&
+        v->fog_mode == fog_mode && v->fog_coord_w == fog_coord_w && v->dual_source == dual_source &&
+        v->flat_shading == flat_shading && v->emit_sample_mask == emit_sample_mask &&
+        v->unorm_snap_mask == unorm_snap_mask)
       return it->second.get();
     // Verified 64-bit collision: fall through to a fresh (uncached) compile.
   }
@@ -1314,9 +1320,9 @@ MTLD3D9PixelShader::GetFunction(void *pData, UINT *pSizeOfData) {
 
 namespace {
 // True when two bytecode blobs are byte-for-byte identical. The module
-// map keys on a 64-bit hash, which (unlike DXVK's Sha1 ShaderKey) is not
-// collision-proof, so a hash hit is confirmed with this before reusing a
-// module. Cheap: identical shaders match on the length check + a memcmp
+// map keys on a 64-bit hash, which (unlike the cryptographic digest DXVK keys
+// its shader modules on) is not collision-proof, so a hash hit is confirmed
+// with this before reusing a module. Cheap: identical shaders match on the length check + a memcmp
 // of a few hundred DWORDs; the only cost is on a genuine hit, which is
 // exactly the path we want to be correct.
 bool
@@ -1325,17 +1331,18 @@ bytecode_equal(const DWORD *a, size_t a_dwords, const DWORD *b, size_t b_dwords)
 }
 } // namespace
 
-// Device-level vertex-shader module dedup. Mirrors DXVK's
-// D3D9ShaderModuleSet::GetShaderModule (src/d3d9/d3d9_shader.cpp): lock,
-// probe by key, compile-on-miss outside the lock, then re-lock and insert
-// with a double-check that discards the redundant module if another
-// thread won the race. The map pins every module for device lifetime (so
-// a recreation of the same bytecode reuses the compiled artifact and its
-// variant cache), matching getOrCreateDSSO / getOrCreateSampler.
+// Device-level vertex-shader module dedup, the same role as DXVK's
+// D3D9ShaderModuleSet::GetShaderModule but not the same shape: probe under the
+// lock, compile a miss OUTSIDE it, then re-lock and insert with a double-check
+// that discards the redundant module if another thread won the race. DXVK holds
+// one lock across the compile, so two threads compiling different shaders
+// serialise; the extra work here is a duplicate compile in the rare race, which
+// is the cheaper trade when a compile is a translate plus an AIR link. The map
+// pins every module for device lifetime (so a recreation of the same bytecode
+// reuses the compiled artifact and its variant cache), matching
+// getOrCreateDSSO / getOrCreateSampler.
 Rc<MTLD3D9VertexShaderModule>
-MTLD3D9Device::getOrCreateVertexShaderModule(
-    const DWORD *byte_code, size_t dwordCount, DxsoShaderMetadata metadata
-) {
+MTLD3D9Device::getOrCreateVertexShaderModule(const DWORD *byte_code, size_t dwordCount, DxsoShaderMetadata metadata) {
   uint64_t hash = bytecode_hash(byte_code, dwordCount);
   {
     std::unique_lock<dxmt::mutex> lock(m_shaderModuleMutex);
@@ -1344,13 +1351,16 @@ MTLD3D9Device::getOrCreateVertexShaderModule(
       // (a 64-bit collision would otherwise compile draws against the
       // wrong shader). On a true collision, fall through and build a
       // fresh module; it just won't be deduped against this slot.
-      if (bytecode_equal(byte_code, dwordCount, it->second->bytecode(), it->second->bytecodeByteLength() / sizeof(DWORD))) {
+      if (bytecode_equal(
+              byte_code, dwordCount, it->second->bytecode(), it->second->bytecodeByteLength() / sizeof(DWORD)
+          )) {
         return it->second;
       }
     }
   }
 
-  Rc<MTLD3D9VertexShaderModule> module = new MTLD3D9VertexShaderModule(this, byte_code, dwordCount, std::move(metadata));
+  Rc<MTLD3D9VertexShaderModule> module =
+      new MTLD3D9VertexShaderModule(this, byte_code, dwordCount, std::move(metadata));
 
   std::unique_lock<dxmt::mutex> lock(m_shaderModuleMutex);
   auto [it, inserted] = m_vsShaderModules.emplace(hash, module);
@@ -1366,14 +1376,14 @@ MTLD3D9Device::getOrCreateVertexShaderModule(
 // Device-level pixel-shader module dedup. Same shape as the vertex path
 // above; see DXVK D3D9ShaderModuleSet::GetShaderModule.
 Rc<MTLD3D9PixelShaderModule>
-MTLD3D9Device::getOrCreatePixelShaderModule(
-    const DWORD *byte_code, size_t dwordCount, DxsoShaderMetadata metadata
-) {
+MTLD3D9Device::getOrCreatePixelShaderModule(const DWORD *byte_code, size_t dwordCount, DxsoShaderMetadata metadata) {
   uint64_t hash = bytecode_hash(byte_code, dwordCount);
   {
     std::unique_lock<dxmt::mutex> lock(m_shaderModuleMutex);
     if (auto it = m_psShaderModules.find(hash); it != m_psShaderModules.end()) {
-      if (bytecode_equal(byte_code, dwordCount, it->second->bytecode(), it->second->bytecodeByteLength() / sizeof(DWORD))) {
+      if (bytecode_equal(
+              byte_code, dwordCount, it->second->bytecode(), it->second->bytecodeByteLength() / sizeof(DWORD)
+          )) {
         return it->second;
       }
     }

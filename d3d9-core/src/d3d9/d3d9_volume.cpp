@@ -104,7 +104,8 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
   D9DeviceLock lock = m_device->LockDevice();
   dxmt::perf::ScopedFrameDurationCounted _lock_timer(
       m_device->frameStats(), &dxmt::FrameStatistics::frame_resource_lock_interval,
-      &dxmt::FrameStatistics::frame_resource_lock_count);
+      &dxmt::FrameStatistics::frame_resource_lock_count
+  );
   if (!pLockedVolume)
     return D3DERR_INVALIDCALL;
   pLockedVolume->RowPitch = 0;
@@ -127,7 +128,7 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
     Flags &= ~D3DLOCK_DISCARD;
   if (m_desc.Pool != D3DPOOL_DEFAULT)
     Flags &= ~D3DLOCK_DISCARD;
-  // DOC-DIV (cosmetic): like MTLD3D9Surface::LockRect, image locks do not strip
+  // Divergence from DXVK: like MTLD3D9Surface::LockRect, image locks do not strip
   // DISCARD on a lost device the way DXVK LockImage and the buffer path do;
   // contents are undefined during device loss, so it is unobservable.
 
@@ -169,8 +170,7 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
   if (!m_mapped_base)
     return D3DERR_INVALIDCALL;
   uint8_t *base = static_cast<uint8_t *>(m_mapped_base);
-  size_t offset = static_cast<size_t>(z0) * m_slice_pitch +
-                  (static_cast<size_t>(y0) / block_h) * m_row_pitch +
+  size_t offset = static_cast<size_t>(z0) * m_slice_pitch + (static_cast<size_t>(y0) / block_h) * m_row_pitch +
                   (static_cast<size_t>(x0) / block_w) * col_step;
   pLockedVolume->RowPitch = static_cast<INT>(m_row_pitch);
   pLockedVolume->SlicePitch = static_cast<INT>(m_slice_pitch);

@@ -7,8 +7,6 @@
 #include "d3d9_resource_priority.hpp"
 
 #include <algorithm>
-#include <chrono>
-
 namespace dxmt {
 
 MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
@@ -43,8 +41,9 @@ MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
   // a DYNAMIC texture is lockable regardless of pool, so it gets the same
   // sysmem mirror + upload-on-unlock as the CPU pools (matches the 2D path in
   // buildLevelsAndMirror). Volumes are never RT/DS, so no usage guard is needed.
-  const bool needs_mirror = (pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
-                             (pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC)));
+  const bool needs_mirror =
+      (pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
+       (pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC)));
   m_mirrorOffsets.resize(levels + 1u);
   size_t total_bytes = 0;
   for (UINT lvl = 0; lvl < levels; ++lvl) {
@@ -102,8 +101,7 @@ MTLD3D9VolumeTexture::markLosable() {
     m_isLosable = true;
     // Level-0 slice bytes times depth; see MTLD3D9Texture::markLosable.
     m_losableBytes = static_cast<int64_t>(D3DFormatLockPitch(m_format, m_width_l0)) *
-                     static_cast<int64_t>(D3DFormatRowCount(m_format, m_height_l0)) *
-                     static_cast<int64_t>(m_depth_l0);
+                     static_cast<int64_t>(D3DFormatRowCount(m_format, m_height_l0)) * static_cast<int64_t>(m_depth_l0);
     m_device->onLosableResourceCreated(m_losableBytes);
   }
 }

@@ -13,9 +13,9 @@
 
 #include <cstdint>
 
-// Pure gamma-ramp helpers factored out of the swapchain so the host unit tier
-// can exercise the identity synthesis and the windowed-vs-fullscreen apply
-// decision without a Metal presenter (the d3d9_viewport.hpp /
+// Pure gamma-ramp helpers factored out of the swapchain, so the identity
+// synthesis and the windowed-vs-fullscreen apply decision stand free of any
+// Metal presenter (the d3d9_viewport.hpp /
 // d3d9_create_validation.hpp shape). References: wined3d (PRIMARY)
 // dlls/wined3d/swapchain.c wined3d_swapchain_set_gamma_ramp pushes the ramp to
 // the OS output (display-wide, no windowed gate); DXVK (secondary)
@@ -60,7 +60,7 @@ IsIdentityGammaRamp(const D3DGAMMARAMP &ramp) {
 }
 
 // The stored ramp is applied to the present only in fullscreen and only when it
-// is non-identity (F3-O1 + F3-D2). A windowed present shows no gamma (native
+// is non-identity. A windowed present shows no gamma (native
 // gamma is the fullscreen display ramp D3DCAPS2_FULLSCREENGAMMA names), and an
 // identity ramp changes nothing; either way the presenter runs LUT-free. DXVK
 // gates its blitter LUT the same way (d3d9_swapchain.cpp SetGammaRamp).

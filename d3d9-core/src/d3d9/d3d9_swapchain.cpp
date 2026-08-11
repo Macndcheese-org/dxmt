@@ -17,6 +17,7 @@
 #include "dxmt_command_queue.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
 #include "util_env.hpp"
 #include "wsi_monitor.hpp"
@@ -32,7 +33,7 @@
 #endif
 
 // S_PRESENT_OCCLUDED / S_PRESENT_MODE_CHANGED are D3D9Ex success-status
-// codes (MAKE_D3DSTATUS(2168) / 2169). mingw's bundled d3d9.h omits
+// codes (MAKE_D3DSTATUS(2168) / 2167). mingw's bundled d3d9.h omits
 // them; the dxmt-native d3d9.h defines them but isn't visible in the
 // cross-build. Shim for build parity: values match wine's d3d9.h.
 #ifndef S_PRESENT_OCCLUDED
@@ -115,15 +116,17 @@ logSwapParams(const D3DPRESENT_PARAMETERS &params, const char *when) {
   if (!d9PresentDbgEnabled())
     return;
   const UINT count = std::max<UINT>(1u, params.BackBufferCount);
-  Logger::warn(str::format(
-      "d9 swap params (", when, "): ", params.BackBufferWidth, "x", params.BackBufferHeight,
-      " fmt=", static_cast<uint32_t>(params.BackBufferFormat), " count=", params.BackBufferCount,
-      " swapEffect=", static_cast<uint32_t>(params.SwapEffect), " windowed=", params.Windowed ? 1 : 0,
-      " presentInterval=", static_cast<uint32_t>(params.PresentationInterval),
-      " flags=", static_cast<uint32_t>(params.Flags), " msaaType=", static_cast<uint32_t>(params.MultiSampleType),
-      " msaaQuality=", params.MultiSampleQuality, " refreshHz=", params.FullScreen_RefreshRateInHz,
-      " rotation=", (count > 1 && params.SwapEffect != D3DSWAPEFFECT_COPY) ? "on" : "off"
-  ));
+  Logger::warn(
+      str::format(
+          "d9 swap params (", when, "): ", params.BackBufferWidth, "x", params.BackBufferHeight,
+          " fmt=", static_cast<uint32_t>(params.BackBufferFormat), " count=", params.BackBufferCount,
+          " swapEffect=", static_cast<uint32_t>(params.SwapEffect), " windowed=", params.Windowed ? 1 : 0,
+          " presentInterval=", static_cast<uint32_t>(params.PresentationInterval),
+          " flags=", static_cast<uint32_t>(params.Flags), " msaaType=", static_cast<uint32_t>(params.MultiSampleType),
+          " msaaQuality=", params.MultiSampleQuality, " refreshHz=", params.FullScreen_RefreshRateInHz,
+          " rotation=", (count > 1 && params.SwapEffect != D3DSWAPEFFECT_COPY) ? "on" : "off"
+      )
+  );
 }
 
 // Backbuffer texture descriptor + D3DSURFACE_DESC derived from a
@@ -133,7 +136,9 @@ logSwapParams(const D3DPRESENT_PARAMETERS &params, const char *when) {
 // MSAA backbuffers (sample_count from params.MultiSampleType) lands
 // in one shape, not two.
 static void
-backBufferDescriptors(const D3DPRESENT_PARAMETERS &params, uint32_t sampleCount, WMTTextureInfo &info, D3DSURFACE_DESC &desc) {
+backBufferDescriptors(
+    const D3DPRESENT_PARAMETERS &params, uint32_t sampleCount, WMTTextureInfo &info, D3DSURFACE_DESC &desc
+) {
   info = {};
   info.pixel_format = D3DFormatToMetal(params.BackBufferFormat, D3D9FormatUsage::RenderTarget);
   info.width = params.BackBufferWidth;
@@ -203,7 +208,7 @@ buildResolveTarget(MTLD3D9Device *device, const WMTTextureInfo &bbInfo) {
 
 // Drawable extent = live window client size (not stale layer drawable).
 // d3d9 sizes off the window (not backbuffer like d3d11) to avoid upscaling
-// during fullscreen↔windowed transitions. Per-Present re-probe converges on
+// during fullscreen<->windowed transitions. Per-Present re-probe converges on
 // correct drawable once NSView resize settles.
 static void
 layerDrawableExtent(
@@ -227,17 +232,19 @@ layerDrawableExtent(
     static uint64_t last_out_w = 0, last_out_h = 0;
     static uint32_t last_bb_w = 0, last_bb_h = 0;
     static uint64_t repeats = 0;
-    if (win_w != last_win_w || win_h != last_win_h || (uint64_t)out_w != last_out_w ||
-        (uint64_t)out_h != last_out_h || params.BackBufferWidth != last_bb_w ||
-        params.BackBufferHeight != last_bb_h) {
-      Logger::warn(str::format(
-          "d9 layer extent: backbuffer ", params.BackBufferWidth, "x", params.BackBufferHeight, " window-client ",
-          win_w, "x", win_h, " pinned-drawable ", (uint64_t)current.drawable_width, "x",
-          (uint64_t)current.drawable_height, " contents_scale ", current.contents_scale, " -> drawable ",
-          (uint64_t)out_w, "x", (uint64_t)out_h, " present=",
-          ((uint64_t)out_w == params.BackBufferWidth && (uint64_t)out_h == params.BackBufferHeight) ? "blit" : "scale",
-          " afterPresents=", repeats
-      ));
+    if (win_w != last_win_w || win_h != last_win_h || (uint64_t)out_w != last_out_w || (uint64_t)out_h != last_out_h ||
+        params.BackBufferWidth != last_bb_w || params.BackBufferHeight != last_bb_h) {
+      Logger::warn(
+          str::format(
+              "d9 layer extent: backbuffer ", params.BackBufferWidth, "x", params.BackBufferHeight, " window-client ",
+              win_w, "x", win_h, " pinned-drawable ", (uint64_t)current.drawable_width, "x",
+              (uint64_t)current.drawable_height, " contents_scale ", current.contents_scale, " -> drawable ",
+              (uint64_t)out_w, "x", (uint64_t)out_h, " present=",
+              ((uint64_t)out_w == params.BackBufferWidth && (uint64_t)out_h == params.BackBufferHeight) ? "blit"
+                                                                                                        : "scale",
+              " afterPresents=", repeats
+          )
+      );
       last_win_w = win_w, last_win_h = win_h;
       last_out_w = (uint64_t)out_w, last_out_h = (uint64_t)out_h;
       last_bb_w = params.BackBufferWidth, last_bb_h = params.BackBufferHeight;
@@ -285,7 +292,8 @@ MTLD3D9SwapChain::MTLD3D9SwapChain(
     m_device(device),
     m_isEx(isEx),
     m_isImplicit(isImplicit),
-    m_params(params) {
+    m_params(params),
+    m_hud(WMT::DeveloperHUDProperties::instance()) {
   // GetPresentParameters reports the resolved device window: the app's
   // hDeviceWindow when non-null, otherwise the device's focus window. Store
   // the effective window so the reported params match what D3D9 substitutes
@@ -301,6 +309,12 @@ MTLD3D9SwapChain::MTLD3D9SwapChain(
   }
 
   createPresentTarget(hEffectiveWindow);
+
+  // Name the layer on the developer HUD the way the d3d11 chain does. Ordered
+  // after the Metal view exists, since the HUD properties singleton only comes
+  // up once a layer is presenting. D3D9 predates feature levels; 0x9300 shapes
+  // the heading like the sibling's rather than reporting an unknown one.
+  m_hud.initialize(GetVersionDescriptionText(9, 0x9300));
 }
 
 void
@@ -343,7 +357,7 @@ MTLD3D9SwapChain::createPresentTarget(HWND hEffectiveWindow) {
       m_presenter->setPresentAlphaMode(/*DXGI_ALPHA_MODE_IGNORE=*/3);
       // Drawable extent = the host window's live client size (see
       // layerDrawableExtent). When BackBufferWidth/Height differ, pre-
-      // modern games hardcode 1024×768 etc., the Presenter's present_scale_
+      // modern games hardcode 1024x768 etc., the Presenter's present_scale_
       // PSO does a fit-to-drawable blit. d3d11 sizes off the backbuffer
       // here (d3d11_swapchain.cpp ApplyLayerProps); d3d9 forks to the
       // window because the legacy-resolution problem only really hits dx9
@@ -388,9 +402,7 @@ MTLD3D9SwapChain::destroyPresentTarget(bool defer_view_release) {
       // still reference this view from the encode thread and Metal does not
       // retain the layer for un-encoded work. Defer to GPU completion, FIFO
       // after that chunk's encode + retire (the override-target defer shape).
-      m_device->dxmtQueue().CurrentChunk()->addCompletionTarget(
-          std::make_shared<D9DeferredViewRelease>(m_view)
-      );
+      m_device->dxmtQueue().CurrentChunk()->addCompletionTarget(std::make_shared<D9DeferredViewRelease>(m_view));
     } else {
       // Inline release, safe because the caller drained the GPU first (implicit
       // teardown after the device drain, or the Reset window-change branch).
@@ -598,7 +610,7 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
   }
   // Re-evaluate the gamma gate against the new params: a rebuilt Presenter
   // starts with an identity LUT, and a windowed<->fullscreen flip changes
-  // whether the stored ramp applies at all (F3-O1, fullscreen-only). reapply
+  // whether the stored ramp applies at all (fullscreen-only). reapply
   // re-pushes the stored ramp in fullscreen and clears it when windowed;
   // no-ops on a headless chain or when no ramp was ever set.
   reapplyGammaRamp();
@@ -647,9 +659,7 @@ MTLD3D9SwapChain::releaseOverrideTarget(OverrideTarget &target, bool defer_view_
     // captured this target may not be encoded yet, and Metal does not retain
     // the layer for un-encoded work. Defer the release to GPU completion, which
     // is FIFO after that chunk's encode and retire.
-    m_device->dxmtQueue().CurrentChunk()->addCompletionTarget(
-        std::make_shared<D9DeferredViewRelease>(target.view)
-    );
+    m_device->dxmtQueue().CurrentChunk()->addCompletionTarget(std::make_shared<D9DeferredViewRelease>(target.view));
   } else {
     // Inline teardown. The implicit chain is destroyed only after the device
     // drains its queue, so every present chunk has retired and the view is
@@ -771,19 +781,22 @@ MTLD3D9SwapChain::Present(
   // spec shape), D3D_OK otherwise.
   if (HRESULT state = m_device->presentStateGate(); state != D3D_OK)
     return state;
-  // Foreground-lost probe. d3d11 has the same shape at
-  // d3d11_swapchain.cpp. For Ex devices the spec return is
-  // S_PRESENT_OCCLUDED; for non-Ex devices MSDN's "Lost Devices" page
-  // says the DEVICELOST transition is driven by focus loss, but native
-  // doesn't synthesize DEVICELOST on a simple minimize; it just stops
-  // updating the front buffer. We follow that: minimized + Ex returns
-  // S_PRESENT_OCCLUDED; minimized + non-Ex returns D3D_OK after the
-  // draw queue is drained (so resource lifetimes stay coherent across
-  // the no-display window). Skip if no hWnd (headless smokes).
+  // No-display probe. d3d11 has the same shape at d3d11_swapchain.cpp.
+  // MSDN's "Lost Devices" page says the DEVICELOST transition is driven
+  // by focus loss, but native doesn't synthesize DEVICELOST on a simple
+  // minimize; it just stops updating the front buffer. We follow that:
+  // minimized + non-Ex returns D3D_OK after the draw queue is drained
+  // (so resource lifetimes stay coherent across the no-display window).
+  //
+  // An Ex device takes its status from occlusionStatus, the same answer
+  // CheckDeviceState gives, rather than reporting occluded for the icon
+  // state alone: a fullscreen device is reactivated with its window
+  // still minimized, and the two must not disagree about that instant.
+  // Skip if no hWnd (headless smokes).
   if (m_hWindow && wsi::isMinimized(m_hWindow)) {
     m_device->FlushDrawBatch();
     m_device->flushOpenWork();
-    return m_isEx ? S_PRESENT_OCCLUDED : D3D_OK;
+    return m_isEx ? m_device->occlusionStatus(m_hWindow) : D3D_OK;
   }
   // No in-scene gate: apps Present mid-scene (driver behavior, not spec).
   // D3DPRESENT_FORCEIMMEDIATE is documented FLIPEX-only, but DXVK
@@ -859,8 +872,8 @@ MTLD3D9SwapChain::Present(
   // (cmdbuf.commit, presentDrawable, encodeCommands) run on the dxmt
   // encode thread instead of the wow64 main thread. Drain queued batched
   // draws onto a chunk first so the Present chunk observes them through
-  // Metal queue ordering. flushOpenWork() catches any residual sync cmdbuf
-  // work.
+  // Metal queue ordering. flushOpenWork() then drains a Clear that no draw
+  // consumed, so a frame that clears and presents still gets the wipe.
   m_device->FlushDrawBatch();
   m_device->flushOpenWork();
   // Present hDestWindowOverride: retarget this frame to the override
@@ -979,8 +992,7 @@ MTLD3D9SwapChain::Present(
   // PresentationInterval per-frame (apps toggle between menus and gameplay
   // without recreating the chain), so both inputs decide it per Present.
   const DWORD pi = m_params.PresentationInterval;
-  const bool present_immediate =
-      (pi & D3DPRESENT_INTERVAL_IMMEDIATE) || (dwFlags & D3DPRESENT_FORCEIMMEDIATE);
+  const bool present_immediate = (pi & D3DPRESENT_INTERVAL_IMMEDIATE) || (dwFlags & D3DPRESENT_FORCEIMMEDIATE);
   int multiplier = 1; // DEFAULT / ONE
   if (pi & D3DPRESENT_INTERVAL_FOUR)
     multiplier = 4;
@@ -998,12 +1010,14 @@ MTLD3D9SwapChain::Present(
   Rc<dxmt::Texture> canvas = m_frontCanvas;
   if (d9PresentDbgEnabled()) {
     const char *path = (bb_dxmt->sampleCount() > 1 && resolve_target != nullptr) ? "resolve"
-                       : (canvas != nullptr)                                      ? "canvas"
-                                                                                  : "direct";
-    Logger::warn(str::format(
-        "d9 present ", m_presentationCount, ": path=", path, " bb=", (const void *)bb_dxmt.ptr(),
-        " resolve=", (const void *)resolve_target.ptr(), " canvas=", (const void *)canvas.ptr()
-    ));
+                       : (canvas != nullptr)                                     ? "canvas"
+                                                                                 : "direct";
+    Logger::warn(
+        str::format(
+            "d9 present ", m_presentationCount, ": path=", path, " bb=", (const void *)bb_dxmt.ptr(),
+            " resolve=", (const void *)resolve_target.ptr(), " canvas=", (const void *)canvas.ptr()
+        )
+    );
   }
   // Multi-backbuffer content rotation (wined3d swapchain.c wined3d_swapchain_*_
   // rotate, DXVK d3d9_swapchain.cpp Present): a flip chain advances backbuffer
@@ -1055,9 +1069,8 @@ MTLD3D9SwapChain::Present(
       // comes back without the RenderTarget bit, so the encode-side guard
       // would skip the pass. The full view keeps the texture's whole usage.
       ctx.resolve_texture_cmd.resolve(
-          backbuffer, backbuffer->fullView, resolve_target, resolve_target->fullView,
-          ResolveTextureMode::Average, WMTScissorRect{0, 0, bb_w, bb_h}, WMTOrigin{0, 0, 0},
-          WMTSize{bb_w, bb_h, 1}
+          backbuffer, backbuffer->fullView, resolve_target, resolve_target->fullView, ResolveTextureMode::Average,
+          WMTScissorRect{0, 0, bb_w, bb_h}, WMTOrigin{0, 0, 0}, WMTSize{bb_w, bb_h, 1}
       );
       ctx.present(resolve_target, presenter, vsync_duration, state.metadata);
     } else if (canvas != nullptr) {
@@ -1110,9 +1123,9 @@ MTLD3D9SwapChain::Present(
   // thread RT0 resolve and any backbuffer readback keep one stable backing per
   // slot. GetBackBuffer(i) hands back a fixed surface object whose contents
   // advance each frame, matching native's flip chain.
-  // Per-cmdbuf tail signal; the per-FlushDrawBatch signalEvents were
-  // removed to unblock the dxmt_context encoder-list coalescer, so the
-  // ring-recycle event must still get advanced once per cmdbuf. The
+  // Per-cmdbuf tail signal. There is no per-FlushDrawBatch signalEvent (it
+  // would block the dxmt_context encoder-list coalescer), so the ring-recycle
+  // event must still be advanced once per cmdbuf. The
   // Present chunk is the natural end of a frame's cmdbuf; sync paths
   // (UpdateTexture / GetRenderTargetData) still emit their own signal.
   m_device->emitCmdbufTailSignal();
@@ -1141,7 +1154,7 @@ MTLD3D9SwapChain::GetFrontBufferData(IDirect3DSurface9 *pDestSurface) {
   if (!m_isEx && m_device->isDeviceLost())
     return D3DERR_DEVICELOST;
   // The device helper owns the whole readback (window-offset placement,
-  // X8 → A8 conversion, intersection copy) against THIS chain's
+  // X8 -> A8 conversion, intersection copy) against THIS chain's
   // backbuffer, so an additional chain reads its own frame rather
   // than the implicit one's (the DXVK per-chain shape).
   if (m_backBuffers.empty())
@@ -1215,7 +1228,7 @@ MTLD3D9SwapChain::GetRasterStatus(D3DRASTER_STATUS *pRasterStatus) {
 HRESULT STDMETHODCALLTYPE
 MTLD3D9SwapChain::GetDisplayMode(D3DDISPLAYMODE *pMode) {
   D9DeviceLock lock = m_device->LockDevice();
-  // wined3d (swapchain.c → wined3d_output_get_display_mode) and DXVK
+  // wined3d (swapchain.c -> wined3d_output_get_display_mode) and DXVK
   // (d3d9_swapchain.cpp) both report the monitor's current mode, windowed and
   // fullscreen alike, so there is no fork here.
   if (!pMode)
@@ -1312,15 +1325,15 @@ MTLD3D9SwapChain::reapplyGammaRamp() {
   // Gamma is a fullscreen-exclusive display ramp (D3DCAPS2_FULLSCREENGAMMA is
   // the only gamma cap dxmt advertises), and an identity ramp is a no-op. When
   // windowed or identity, clear the presenter LUT so the present blit samples no
-  // gamma, matching DXVK's setGammaRamp(0, nullptr) (d3d9_swapchain.cpp:731-735)
+  // gamma, matching DXVK's setGammaRamp(0, nullptr) (d3d9_swapchain.cpp)
   // and native (a windowed brightness slider is a no-op). changeGammaRamp(null)
   // no-ops when the presenter already runs LUT-free, so a Reset that stays
-  // windowed does not churn the present PSO. F3-O1 + F3-D2.
+  // windowed does not churn the present PSO.
   if (!ShouldApplyGammaRamp(m_gammaRamp, m_params.Windowed)) {
     m_presenter->changeGammaRamp(nullptr);
     return;
   }
-  // Upsample 256 → 1024 with linear interpolation between successive
+  // Upsample 256 -> 1024 with linear interpolation between successive
   // WORD entries. WORD is uint16 in [0, 65535]; the LUT is float in
   // [0, 1]. The 4x oversampling lets the Metal sampler do bilinear
   // interpolation between control points without visible banding. Last

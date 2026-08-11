@@ -6,11 +6,7 @@
 #include "d3d9_shader.hpp"
 #include "d3d9_surface.hpp"
 #include "d3d9_vertex_declaration.hpp"
-
-#include <array>
 #include <cstring>
-#include <memory>
-
 namespace dxmt {
 
 MTLD3D9StateBlock::MTLD3D9StateBlock(MTLD3D9Device *device, D3DSTATEBLOCKTYPE type) : m_device(device), m_type(type) {
@@ -40,7 +36,7 @@ MTLD3D9StateBlock::AddRef() {
   // already has a non-zero pub refcount when the block is created).
   // If a future Reset / device-recreate path constructs state blocks
   // during the device's own ctor window, the first pub-AddRef here
-  // will walk the device refcount through 0→1 and recursively destruct
+  // will walk the device refcount through 0->1 and recursively destruct
   // it; switch to private-ref pinning if that scenario arises.
   if (ref == 1)
     m_device->AddRef();
@@ -352,14 +348,25 @@ MTLD3D9StateBlock::Apply() {
     pod_dirty |= dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES;
   }
   if (m_changes.transforms) {
-    std::memcpy(m_device->m_transforms, m_snapTransforms, sizeof(m_snapTransforms));
+    // Only the indices the block recorded, so a block that captured one matrix
+    // does not drag every other transform back to its value at record time.
+    for (uint32_t i = 0; i < dxmt::kSbcMaxTransforms; ++i) {
+      if (!m_changes.transformMarked(i))
+        continue;
+      m_device->m_transforms[i] = m_snapTransforms[i];
+    }
     // Same as texture_stage_states: the restored transforms must stale
     // the precomputed product and dirty the snapshot axis.
     m_device->m_ffpWVPStale = true;
+    m_device->m_ffpLightsViewStale = true;
     pod_dirty |= dxmt::D9ES_DIRTY_FFP;
   }
   if (m_changes.clip_planes) {
-    std::memcpy(m_device->m_clipPlanes, m_snapClipPlanes, sizeof(m_snapClipPlanes));
+    for (uint32_t i = 0; i < 8; ++i) {
+      if (!m_changes.clipPlaneMarked(i))
+        continue;
+      std::memcpy(m_device->m_clipPlanes[i], m_snapClipPlanes[i], sizeof(m_snapClipPlanes[i]));
+    }
     pod_dirty |= dxmt::D9ES_DIRTY_CLIP_PLANES;
   }
   if (m_changes.viewport) {
@@ -527,6 +534,7 @@ MTLD3D9StateBlock::Apply() {
       }
       m_device->m_lights[idx] = m_snapLights[idx];
       m_device->m_lightEnables[idx] = m_snapLightEnables[idx];
+      m_device->m_ffpLightsViewStale = true;
     }
     // Restored lights feed FFP vertex lighting; dirty the FFP axis the same way
     // SetLight / LightEnable do so the encode side rebuilds.

@@ -23,11 +23,10 @@
 // wined3d_texture_init; DXVK (secondary) src/d3d9/d3d9_common_texture.cpp
 // NormalizeTextureProperties.
 //
-// What stays in the device (needs Metal, a live surface, or carries a
-// diagnostic already pinned by another host test): the shared-handle policy,
-// the MSAA sample-count probe (surfaces only), the format-lowering rejects
-// (unsupported-format and RENDERTARGET-capability, pinned by
-// test_format_matrix / test_color_rt_format and logged for game bring-up), the
+// What stays in the device (needs Metal, a live surface, or a log line for
+// bring-up): the shared-handle policy, the MSAA sample-count probe (surfaces
+// only), the format-lowering rejects (unsupported-format and
+// RENDERTARGET-capability, logged for game bring-up), the
 // allocation itself, and the buffer-backed linear-pitch alignment.
 
 // The managed pool on a D3D9Ex device.  Not in the public D3DPOOL enum -- the
@@ -164,7 +163,7 @@ validate_texture_create(const D3D9TextureCreateInfo &c) {
     }
   }
 
-  // Depth-stencil format placement (C1-O1 / C1-O2). A depth format on a cube
+  // Depth-stencil format placement. A depth format on a cube
   // is rejected outright (any pool, any usage): no native driver backs a depth
   // cube, allowing it trips a broken code path in Gothic 3 (DXVK
   // d3d9_common_texture.cpp), and CheckDeviceFormat already denies CUBETEXTURE
@@ -186,8 +185,7 @@ validate_texture_create(const D3D9TextureCreateInfo &c) {
   // SCRATCH blob; every other format must be a mapped color 3D format
   // (IsVolumeTextureFormat also excludes depth, matching the probe). The 2D
   // and cube unsupported-format / RT-capability rejects stay in the device
-  // where they carry a diagnostic and are pinned by test_format_matrix /
-  // test_color_rt_format.
+  // where they carry a diagnostic for bring-up.
   if (is_volume) {
     if (IsCompressedFormat(c.format) || Is3DcFormat(c.format) || IsScratchableUnsupportedFormat(c.format)) {
       if (c.pool != D3DPOOL_SCRATCH)
@@ -198,11 +196,11 @@ validate_texture_create(const D3D9TextureCreateInfo &c) {
   }
 
   // Levels. 0 means the full chain. A count beyond the chain is rejected
-  // (C1-O7): Metal caps the mip count at the pyramid, so wined3d's
+  //: Metal caps the mip count at the pyramid, so wined3d's
   // degenerate 1x1 tail levels are unrealizable and dxmt fails closed with
-  // INVALIDCALL. No reference pins native's exact HRESULT here (DXVK clamps),
-  // so this is oracle-debt; revisit if a native probe lands (clamp is the
-  // only other option Metal can honour).
+  // INVALIDCALL. No reference pins native's exact HRESULT here and DXVK clamps
+  // instead, so the choice is between failing closed and clamping; Metal can
+  // honour no third option.
   if (c.levels != 0) {
     const uint32_t max_levels = d3d9_full_mip_levels(c.width, c.height, is_volume ? c.depth : 1u);
     if (c.levels > max_levels)

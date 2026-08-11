@@ -37,9 +37,9 @@ struct D9LazyMirrorHost {
   // so per wined3d + DXVK the written bytes stay in the sysmem mirror until a
   // later AddDirtyRect / EvictManagedResources / plain Unlock marks them; the
   // GPU copy is not refreshed. Only the 2D texture host has that deferred
-  // re-upload path (its pre-draw managed sweep + AddDirtyRect eager-upload)
-  // today, so it returns true; the cube host has none, so it keeps the eager
-  // upload-on-unlock and returns false here (unchanged behaviour).
+  // re-upload path (its pre-draw managed sweep + AddDirtyRect eager-upload), so
+  // it returns true; the cube host has none and keeps the eager
+  // upload-on-unlock.
   virtual bool
   deferManagedNoDirtyUpload() const {
     return false;
@@ -49,8 +49,8 @@ protected:
   ~D9LazyMirrorHost() = default;
 };
 
-// Scaffold of IDirect3DSurface9: D3DSURFACE_DESC + container IUnknown*
-// (device, texture, or swapchain). No MTLTexture yet.
+// IDirect3DSurface9: a D3DSURFACE_DESC, the container it belongs to (device,
+// texture or swapchain) and the Metal texture it draws from.
 // References: wined3d surface.c.
 class MTLD3D9Surface final : public ComObject<IDirect3DSurface9> {
 public:
@@ -59,7 +59,7 @@ public:
   // owned by parent (texture/swapchain), stays alive via priv ref.
   // For lockable surfaces: buffer handle, CPU pointer, pitch for LockRect.
   // dxmtTexture: Rc<> wrapping MTLTexture for chunk lambdas to keep
-  // allocation alive across calling→encode thread boundary.
+  // allocation alive across calling->encode thread boundary.
   MTLD3D9Surface(
       MTLD3D9Device *device, const D3DSURFACE_DESC &desc, IUnknown *container, WMT::Reference<WMT::Texture> texture,
       uint32_t mipLevel, bool selfPin, WMTTextureType parentTextureType, WMT::Reference<WMT::Buffer> buffer = {},
@@ -131,8 +131,7 @@ public:
   // sources (CreateRenderTarget, plain CreateTexture mip levels). Cube
   // texture face surfaces set this to 0..5 to identify the face;
   // render-pass attachments and sampler bindings select the slice from
-  // this field. Volume texture sub-resources will reuse the same slot
-  // when they land.
+  // this field.
   uint32_t
   arraySlice() const {
     return m_array_slice;
@@ -145,8 +144,8 @@ public:
   container() const {
     return m_container;
   }
-  // wined3d device.c (StretchRect) + 2354 (rts_flag_auto_gen_mipmap)
-  // both flag the destination/RT container's auto-gen mipmap dirty bit
+  // wined3d device.c (StretchRect and rts_flag_auto_gen_mipmap) both flag the
+  // destination/RT container's auto-gen mipmap dirty bit
   // after a successful op so the lazy regen sweep fires before the next
   // sample. Standalone surfaces and swapchain backbuffers fail the QI
   // and become no-ops; only Texture / CubeTexture containers route
@@ -252,10 +251,6 @@ public:
     m_cpu_ptr = nullptr;
   }
 
-  // Swap Metal backing in place (swapchain ResetForDeviceReset).
-  // Preserves IDirect3DSurface9* identity; apps see current backbuffer
-  // contents, not stale snapshot. New desc/texture replace backing.
-  // Per-bind views resolved off m_dxmtTexture.
   // Reset orphaned this backbuffer: the chain no longer owns it, so
   // GetContainer identity falls back to the device (E_NOINTERFACE for the
   // swapchain, the device still answers), while the desc and contents stay
@@ -263,6 +258,10 @@ public:
   // identity swap; wine's d3d9ex tests pin the contract.
   void detachContainer();
 
+  // Swap the Metal backing in place (swapchain ResetForDeviceReset),
+  // preserving IDirect3DSurface9* identity so apps see the current backbuffer
+  // contents rather than a stale snapshot. Per-bind views resolve off
+  // m_dxmtTexture.
   void
   resetBacking(const D3DSURFACE_DESC &desc, WMT::Reference<WMT::Texture> texture, Rc<dxmt::Texture> dxmtTexture) {
     m_desc = desc;
@@ -281,16 +280,13 @@ public:
   void ensureHostMirror();
 
 private:
-  // Lifetime: device held by surface; first public AddRef→device AddRef, last Release→device Release.
+  // Lifetime: device held by surface; first public AddRef->device AddRef, last Release->device Release.
   // Device-side bookkeeping (SetRenderTarget storing bound surfaces) uses private refs only, never public.
   // Ctor self-pins via AddRefPrivate; pin released at end of Release (if no other priv refs, destructs immediately).
   MTLD3D9Device *m_device;
-  // Raw: the container (parent texture / swapchain / device) outlives
-  // the surface by construction. Swapchain backbuffer surfaces will
-  // store the chain here; CreateRenderTarget standalone surfaces will
-  // store the device. wined3d returns E_NOINTERFACE when container is
-  // null; we never construct a surface with null container, but the
-  // GetContainer path defensively handles it.
+  // Raw: the container (parent texture / swapchain / device) outlives the
+  // surface by construction. wined3d returns E_NOINTERFACE when the container
+  // is null; we never construct one that way, but GetContainer handles it.
   IUnknown *m_container;
   // The parent base texture when this surface is a texture / cube mip-level
   // sub-resource, else null. When set, AddRef/Release delegate entirely to it
@@ -354,8 +350,8 @@ private:
   bool m_ever_locked = false;
   // Per-Lock state read by UnlockRect. The dirty rect is stored in
   // pixel coords (whole-surface if the app passed pRect=NULL). The
-  // readonly bit elides the MANAGED replaceRegion entirely: apps
-  // that promise not to write must not get their data echoed back.
+  // readonly bit elides the MANAGED upload entirely: apps that promise not to
+  // write must not get their data echoed back.
   bool m_locked_readonly = false;
   // D3DLOCK_NO_DIRTY_UPDATE: when set, the parent texture's UnlockRect
   // skips the implicit unionDirtyRect so apps that AddDirtyRect

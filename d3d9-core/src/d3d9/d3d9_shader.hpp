@@ -10,7 +10,6 @@
 
 #include <atomic>
 #include <memory>
-#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -108,13 +107,14 @@ public:
   // Find-or-create the async compile task for this (layout, point-size)
   // variant, submitting it on first request; the encode thread never runs
   // the LLVM emit itself. Returns the shared task (the PSO task waits on it).
-  D3D9CompiledFunction *getVariantTask(const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, bool inject_point_size = false);
+  D3D9CompiledFunction *
+  getVariantTask(const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, bool inject_point_size = false);
 
 private:
   MTLD3D9Device *m_device;
   std::vector<DWORD> m_bytecode;
   DxsoShaderMetadata m_metadata;
-  // Variant cache: (layout fingerprint, point-size injection bit) → compile
+  // Variant cache: (layout fingerprint, point-size injection bit) -> compile
   // task. Owns the tasks; the per-draw caller borrows a non-owning pointer
   // (the cache outlives the draw). Cleared when the module dies. Point-size
   // auto-injection folds a single sentinel into the key
@@ -162,7 +162,7 @@ public:
 
   // Find-or-create the async compile task for the per-(alpha FUNC,
   // sampler-layout) PS variant, submitting it on first request. Sampler kind
-  // resolution: UNKNOWN → infer from dcl (SM 1.4+/2.0+) or default-to-
+  // resolution: UNKNOWN -> infer from dcl (SM 1.4+/2.0+) or default-to-
   // Texture2D (SM 1.0..1.3). The alpha REF and the TexBem bump-env
   // constants ride the shared PS uniform tail, so they are not variant
   // axes here.

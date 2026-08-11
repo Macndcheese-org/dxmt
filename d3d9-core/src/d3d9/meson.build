@@ -54,4 +54,3 @@ d3d9_postprocess = custom_target('postprocess_libd3d9',
 )
 d3d9_postprocess_targets += [d3d9_postprocess]
 endif
-

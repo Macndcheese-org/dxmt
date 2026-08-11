@@ -20,12 +20,11 @@ namespace dxmt {
 // reverse X -> A is deliberately excluded because an X source has no defined
 // alpha; copying it into an A destination would propagate whatever the storage
 // alpha happens to be, so both refs force alpha = 1 through the swizzled /
-// converting blit instead (D3-O6).
+// converting blit instead.
 inline bool
 d3d9_formats_similar(D3DFORMAT src, D3DFORMAT dst) {
   return src == dst || (src == D3DFMT_A8B8G8R8 && dst == D3DFMT_X8B8G8R8) ||
-         (src == D3DFMT_A8R8G8B8 && dst == D3DFMT_X8R8G8B8) ||
-         (src == D3DFMT_A1R5G5B5 && dst == D3DFMT_X1R5G5B5) ||
+         (src == D3DFMT_A8R8G8B8 && dst == D3DFMT_X8R8G8B8) || (src == D3DFMT_A1R5G5B5 && dst == D3DFMT_X1R5G5B5) ||
          (src == D3DFMT_A4R4G4B4 && dst == D3DFMT_X4R4G4B4);
 }
 
@@ -37,8 +36,10 @@ d3d9_formats_similar(D3DFORMAT src, D3DFORMAT dst) {
 inline bool
 d3d9_format_needs_sampler_swizzle(D3DFORMAT format) {
   WMTTextureSwizzleChannels sw = D3DFormatSamplerSwizzle(format);
-  return !(sw.r == WMTTextureSwizzleZero && sw.g == WMTTextureSwizzleZero && sw.b == WMTTextureSwizzleZero &&
-           sw.a == WMTTextureSwizzleZero);
+  return !(
+      sw.r == WMTTextureSwizzleZero && sw.g == WMTTextureSwizzleZero && sw.b == WMTTextureSwizzleZero &&
+      sw.a == WMTTextureSwizzleZero
+  );
 }
 
 // wined3d resource.c wined3d_resource_check_box_dimensions block-mask rule for
@@ -119,7 +120,7 @@ plan_stretch_rect(
   // A texture sub-resource destination is legal only when its texture carries a
   // RENDERTARGET / DEPTHSTENCIL bind; a plain-texture level is INVALIDCALL
   // (wined3d bind check, DXVK dstIsSurface arm). A standalone surface has no
-  // parent texture and is always a valid destination. (D3-O8: DXVK additionally
+  // parent texture and is always a valid destination. (DXVK additionally
   // permits an exact whole-surface copy into a plain-texture level on a D3D9Ex
   // device, a native-verified relaxation wined3d does not implement; dxmt sits
   // with wined3d, the primary reference. Follow DXVK only if a title surfaces.)
@@ -231,7 +232,7 @@ plan_stretch_rect(
   // fall-off-the-fast-path route DXVK takes (d3d9_device.cpp, equal-count
   // MSAA -> MSAA drops the copy fast path to the draw blit). A count mismatch
   // stays rejected (no title needs it, native's handling unverified); compressed
-  // formats can never be multisampled. (D3-O3)
+  // formats can never be multisampled.
   if (src_ms && dst_ms) {
     if (src.sample_count != dst.sample_count)
       return fail();
@@ -251,7 +252,7 @@ plan_stretch_rect(
   // scaled resolve, or a resolve from a fixup-needing source, resolves to a
   // transient at the source extent and then Stretches so the scale and the
   // channel fixup are both honoured; a bare 1:1 Resolve would crop instead of
-  // scale and would skip the source swizzle (D3-O1). Neither BC (uncompressible
+  // scale and would skip the source swizzle. Neither BC (uncompressible
   // as MSAA on the source) nor a BC destination is reachable: reject a BC dst
   // that would need the renderable resolve/stretch path.
   if (src_ms) {
@@ -265,7 +266,7 @@ plan_stretch_rect(
     return plan;
   }
 
-  // Single-sample source -> MSAA destination (D3-O2). Metal cannot blit-copy
+  // Single-sample source -> MSAA destination. Metal cannot blit-copy
   // into a multisampled texture; it needs a render pass at the destination
   // sample count that broadcasts the sampled source into every sample. The
   // StretchBlit path does exactly that, its PSO + render pass keyed on the dst
@@ -294,13 +295,13 @@ plan_stretch_rect(
 
   // Both single-sampled. A raw copy is legal only for a same-Metal-format,
   // same-extent, alpha-safe pair (identical D3DFORMAT, or the alpha -> X rows);
-  // everything else (scale, convert, or the X -> A alpha fix of D3-O6) takes the
+  // everything else (scale, convert, or the X -> A alpha fix) takes the
   // render-pass Stretch.
-  const bool copy_ok = !extent_mismatch && src.metal_format == dst.metal_format &&
-                       d3d9_formats_similar(src.d3d_format, dst.d3d_format);
+  const bool copy_ok =
+      !extent_mismatch && src.metal_format == dst.metal_format && d3d9_formats_similar(src.d3d_format, dst.d3d_format);
   if (copy_ok) {
     // A compressed same-format copy must be block-aligned on both sides (edge
-    // exempt), or MTLBlitCommandEncoder rejects the unaligned origin (D3-O5).
+    // exempt), or MTLBlitCommandEncoder rejects the unaligned origin.
     if (!d3d9_rect_block_aligned(src.d3d_format, sx0, sy0, sx0 + sw, sy0 + sh, src.width, src.height) ||
         !d3d9_rect_block_aligned(dst.d3d_format, dx0, dy0, dx0 + dw, dy0 + dh, dst.width, dst.height))
       return fail();

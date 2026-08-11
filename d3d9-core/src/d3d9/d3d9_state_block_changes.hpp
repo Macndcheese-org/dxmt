@@ -14,9 +14,9 @@
 #include <cstdint>
 
 // The per-category + per-render-state change-tracking mask a state block owns,
-// factored out of d3d9_device.hpp so the host unit tier can pin the
-// D3DSBT_PIXELSTATE / D3DSBT_VERTEXSTATE / D3DSBT_ALL membership tables without
-// the device / Metal include surface (the d3d9_viewport.hpp / d3d9_gamma.hpp
+// factored out of d3d9_device.hpp so the D3DSBT_PIXELSTATE /
+// D3DSBT_VERTEXSTATE / D3DSBT_ALL membership tables stand free of the device
+// and Metal include surface (the d3d9_viewport.hpp / d3d9_gamma.hpp
 // shape). A drifted membership list is exactly the bug class markPixelStateSubset
 // / markVertexStateSubset guard against. References: wined3d (PRIMARY)
 // dlls/wined3d/stateblock.c savedstates + pixel_states_* / vertex_states_*
@@ -32,6 +32,9 @@ namespace dxmt {
 inline constexpr uint16_t kSbcMaxVsConstF = 256;
 inline constexpr uint16_t kSbcMaxPsConstF = 224;
 inline constexpr uint32_t kSbcMaxTextureUnits = 20;
+// Ten named transforms plus 256 world-matrix slots, one bit each.
+inline constexpr uint32_t kSbcMaxTransforms = 10 + 256;
+inline constexpr uint32_t kSbcTransformMaskWords = (kSbcMaxTransforms + 63) / 64;
 
 // Per-category + per-render-state mask of states an app touched between
 // BeginStateBlock and EndStateBlock, OR every state for D3DSBT_ALL
@@ -55,7 +58,16 @@ struct D3D9StateBlockChanges {
   uint32_t tss_element_mask = 0;
   uint32_t samp_element_mask = 0;
   bool transforms = false;
+  // Which transform indices the block actually recorded, when it recorded them
+  // one at a time. Empty means every index, which is what a predefined block
+  // and a seed capture want. Without this a block that recorded one transform
+  // restores all 266 on Apply, including any the application set after the
+  // recording ended: wined3d tracks a per-element bitmap here and DXVK a
+  // per-element bitset for the same reason.
+  uint64_t transform_mask[kSbcTransformMaskWords] = {};
   bool clip_planes = false;
+  // Same shape for the eight user clip planes.
+  uint32_t clip_plane_mask = 0;
   bool viewport = false;
   bool scissor = false;
   bool fvf = false;
@@ -100,11 +112,45 @@ struct D3D9StateBlockChanges {
     *this = D3D9StateBlockChanges{};
   }
 
+  // Record one transform / clip plane. Marking an element also marks the
+  // category, so the Apply gate stays a single test.
+  void
+  markTransform(uint32_t index) {
+    transforms = true;
+    if (index < kSbcMaxTransforms)
+      transform_mask[index / 64] |= uint64_t(1) << (index % 64);
+  }
+
+  bool
+  transformMarked(uint32_t index) const {
+    for (const auto w : transform_mask)
+      if (w)
+        return index < kSbcMaxTransforms && (transform_mask[index / 64] >> (index % 64)) & 1;
+    return true; // no per-element record: the whole category
+  }
+
+  void
+  markClipPlane(uint32_t index) {
+    clip_planes = true;
+    if (index < 8)
+      clip_plane_mask |= 1u << index;
+  }
+
+  bool
+  clipPlaneMarked(uint32_t index) const {
+    return clip_plane_mask == 0 || (clip_plane_mask & (1u << index)) != 0;
+  }
+
   void
   markAll() {
     for (auto &b : render_states)
       b = true;
     sampler_states = texture_stage_states = transforms = clip_planes = true;
+    // Empty masks mean "every element", which is what markAll wants; leaving
+    // them zero is deliberate rather than an omission.
+    for (auto &w : transform_mask)
+      w = 0;
+    clip_plane_mask = 0;
     viewport = scissor = fvf = material = true;
     stream_source = stream_freq = 0xFFFF;
     vs_constants = ps_constants = true;
@@ -212,18 +258,9 @@ struct D3D9StateBlockChanges {
         D3DTSS_TEXTURETRANSFORMFLAGS,
     };
     static constexpr D3DSAMPLERSTATETYPE pixel_states_sampler[] = {
-        D3DSAMP_ADDRESSU,
-        D3DSAMP_ADDRESSV,
-        D3DSAMP_ADDRESSW,
-        D3DSAMP_BORDERCOLOR,
-        D3DSAMP_MAGFILTER,
-        D3DSAMP_MINFILTER,
-        D3DSAMP_MIPFILTER,
-        D3DSAMP_MIPMAPLODBIAS,
-        D3DSAMP_MAXMIPLEVEL,
-        D3DSAMP_MAXANISOTROPY,
-        D3DSAMP_SRGBTEXTURE,
-        D3DSAMP_ELEMENTINDEX,
+        D3DSAMP_ADDRESSU,    D3DSAMP_ADDRESSV,      D3DSAMP_ADDRESSW,    D3DSAMP_BORDERCOLOR,
+        D3DSAMP_MAGFILTER,   D3DSAMP_MINFILTER,     D3DSAMP_MIPFILTER,   D3DSAMP_MIPMAPLODBIAS,
+        D3DSAMP_MAXMIPLEVEL, D3DSAMP_MAXANISOTROPY, D3DSAMP_SRGBTEXTURE, D3DSAMP_ELEMENTINDEX,
     };
     for (auto e : pixel_states_texture)
       tss_element_mask |= 1u << e;

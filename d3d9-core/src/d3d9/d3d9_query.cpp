@@ -101,7 +101,7 @@ MTLD3D9Query::GetType() {
 DWORD STDMETHODCALLTYPE
 MTLD3D9Query::GetDataSize() {
   D9DeviceLock lock = m_device->LockDevice();
-  // Pure per-type table, host-pinned in test_query.cpp. Getting these wrong
+  // Pure per-type table. Getting these wrong
   // corrupts memory when the app passes a buffer sized to the documented type.
   return d3d9_query_data_size(m_type);
 }
@@ -112,7 +112,7 @@ MTLD3D9Query::Issue(DWORD dwIssueFlags) {
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_query_issue_count);
   // D3DISSUE_BEGIN starts a query (only OCCLUSION uses BEGIN; EVENT
   // and TIMESTAMP are END-only). D3DISSUE_END signals the GPU to
-  // capture the current value. wined3d query.c d3d9_query_Issue
+  // capture the current value. wine dlls/d3d9 query.c d3d9_query_Issue
   // accepts both flags as a no-op on unsupported types.
   if (dwIssueFlags & D3DISSUE_BEGIN) {
     if (m_type == D3DQUERYTYPE_OCCLUSION) {
@@ -123,8 +123,8 @@ MTLD3D9Query::Issue(DWORD dwIssueFlags) {
       endOcclusionIfActive();
 
       // Fresh VisibilityResultQuery on each Begin. Must FlushDrawBatch before emitcc:
-      // d3d9 batches draws on calling-thread; FIFO becomes [pre-Begin batch → begin → subsequent batches].
-      // If begin emitted before flush: [begin → end → draws-bundle] coalesces begin==end to same slot,
+      // d3d9 batches draws on calling-thread; FIFO becomes [pre-Begin batch -> begin -> subsequent batches].
+      // If begin emitted before flush: [begin -> end -> draws-bundle] coalesces begin==end to same slot,
       // GPU counter never increments. d3d11 has no batching layer, so doesn't need this.
       m_device->FlushDrawBatch();
       m_visibility_query = new VisibilityResultQuery();
@@ -332,8 +332,11 @@ MTLD3D9Query::getDataImpl(void *pData, DWORD dwSize, DWORD dwGetDataFlags) {
     return D3D_OK;
   }
   case D3DQUERYTYPE_TIMESTAMPFREQ: {
-    // 1 GHz so TIMESTAMP values are interpretable as nanoseconds.
-    // wined3d uses the same convention for software-timestamped paths.
+    // 1 GHz, which follows from TIMESTAMP being a host nanosecond clock here
+    // rather than a GPU tick counter: reporting the frequency the timestamps
+    // are actually in is what makes a TIMESTAMP delta divide out to seconds.
+    // A reference with real GPU timestamps derives this from the hardware
+    // tick period instead.
     UINT64 freq = 1000000000ull;
     std::memcpy(pData, &freq, dwSize < sizeof(freq) ? dwSize : sizeof(freq));
     return D3D_OK;

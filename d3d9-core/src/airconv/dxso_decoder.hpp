@@ -1,5 +1,12 @@
 #pragma once
 
+// DXVK citations in this file name its DXSO compiler as it stood at the
+// revision this translator was read against (src/dxso/). Upstream has since
+// rewritten that path into the dxbc-spirv subproject, where those function
+// names no longer resolve, so read a citation as the approach it describes
+// rather than as a file to open. The behaviour each one attributes was checked
+// against the DXVK it names.
+
 #include "dxso_header.hpp"
 
 #include <cstdint>
@@ -271,7 +278,7 @@ enum class DxsoTextureType : uint8_t {
 
 // Declaration token (body[0] of Dcl) layout:
 //   bits  0..3   : usage
-//   bits 16..19  : usage index (e.g. TEXCOORD3 → index = 3)
+//   bits 16..19  : usage index (e.g. TEXCOORD3 -> index = 3)
 //   bits 27..30  : texture type (sampler dcls only; 0 otherwise)
 // DXVK src/dxso/dxso_decoder.cpp.
 struct DxsoDeclaration {
@@ -289,9 +296,9 @@ dxso_decode_declaration(uint32_t token) {
   return d;
 }
 
-// `def c#, x, y, z, w`     → DxsoDefKind::Float32 (4 IEEE floats)
-// `defi i#, x, y, z, w`    → DxsoDefKind::Int32   (4 signed ints)
-// `defb b#, true|false`    → DxsoDefKind::Bool    (1 DWORD, 0/1)
+// `def c#, x, y, z, w`     -> DxsoDefKind::Float32 (4 IEEE floats)
+// `defi i#, x, y, z, w`    -> DxsoDefKind::Int32   (4 signed ints)
+// `defb b#, true|false`    -> DxsoDefKind::Bool    (1 DWORD, 0/1)
 // The literal is held in raw form; readers cast via the union, the
 // kind tag picks the lane. Mirrors DXVK src/dxso/dxso_decoder.h
 // DxsoDefinition (a union there too).
@@ -316,12 +323,12 @@ struct DxsoDefinition {
 // two ranges in the token: bits 11..12 (high) and bits 28..30 (low),
 // reassembled into a 5-bit value (0..31). DXVK src/dxso/
 // dxso_decoder.cpp. The naive `(type << 28)` encoding silently
-// drops types ≥ 8: hand-authored DXSO blobs must split the high bit
+// drops types >= 8: hand-authored DXSO blobs must split the high bit
 // out into bit 11 explicitly.
 inline DxsoBaseRegister
 dxso_decode_base_register(uint32_t token) {
-  uint32_t type_bits = ((token & 0x00001800u) >> 8)     // bits 11..12 → 3..4
-                       | ((token & 0x70000000u) >> 28); // bits 28..30 → 0..2
+  uint32_t type_bits = ((token & 0x00001800u) >> 8)     // bits 11..12 -> 3..4
+                       | ((token & 0x70000000u) >> 28); // bits 28..30 -> 0..2
   return DxsoBaseRegister{static_cast<DxsoRegisterType>(type_bits), static_cast<uint16_t>(token & 0x7FFu)};
 }
 
@@ -636,7 +643,7 @@ dxso_decode_operands(
         // with detached joints. Keep it relative against a0.x.
         s.relative.base.type = DxsoRegisterType::Addr;
         s.relative.base.num = 0;
-        s.relative.swizzle = DxsoRegSwizzle(); // identity → component .x
+        s.relative.swizzle = DxsoRegSwizzle(); // identity -> component .x
       }
     }
     if (out.src_count < kDxsoMaxOperandCount)
@@ -857,14 +864,14 @@ struct DxsoShaderMetadata {
   bool uses_kill = false;
   bool uses_derivatives = false;
   // VS only: true when the shader writes its own point size, either
-  // via SM1/2 `mov oPts, …` (RasterizerOut[2]) or SM3 `dcl_psize o#`
+  // via SM1/2 `mov oPts, ...` (RasterizerOut[2]) or SM3 `dcl_psize o#`
   // followed by a write to that register. The host uses this to skip
   // D3DRS_POINTSIZE auto-injection: when a VS computes its own
   // point size, the runtime D3DRS_POINTSIZE value is ignored per
   // D3D9 spec. False on PS / VS that doesn't touch oPts.
   bool writes_point_size = false;
   // VS only: true when the shader writes the fog factor, via SM1/2
-  // `mov oFog, …` or an SM3 `dcl_fog o#`. Gates the PS fixed-fog-blend
+  // `mov oFog, ...` or an SM3 `dcl_fog o#`. Gates the PS fixed-fog-blend
   // variant: no fog write means factor 1.0 and an identity blend. The
   // PS-side `dcl_fog v#` input must not set it, hence the Output-file
   // requirement in the dcl arm below.
@@ -1068,7 +1075,7 @@ walk_dxso_shader(
       else if (ins.src[i].base.num + 1 > md.max_float_const_index)
         md.max_float_const_index = ins.src[i].base.num + 1;
     }
-    // VS oPts detection. SM1/2 emits `mov oPts, …` as a write to
+    // VS oPts detection. SM1/2 emits `mov oPts, ...` as a write to
     // RasterizerOut[2]; SM3 declares `dcl_psize o#` first then writes
     // the bound o#: record the dcl side here (DxsoUsage::PointSize)
     // and the bytecode side via the dst register check. PS bytecode

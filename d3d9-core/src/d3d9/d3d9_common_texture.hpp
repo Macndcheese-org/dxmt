@@ -30,7 +30,7 @@ public:
   virtual WMTPixelFormat metalPixelFormat() const = 0;
 
   // The original D3D9 format. Sample-bind reads this to apply per-
-  // format swizzle (D3DFMT_L8 → {R,R,R,1}, D3DFMT_A8L8 → {R,R,R,G})
+  // format swizzle (D3DFMT_L8 -> {R,R,R,1}, D3DFMT_A8L8 -> {R,R,R,G})
   // since Metal's R8Unorm / RG8Unorm samplers don't replicate the
   // luminance the way D3D9 expects. wined3d does the same swap at
   // bind time on its sampler_view path.
@@ -80,8 +80,10 @@ public:
   hasPendingManagedUpload() const {
     return false;
   }
-  virtual void sweepManagedUpload() {}
-  virtual void evictManagedMirror() {}
+  virtual void
+  sweepManagedUpload() {}
+  virtual void
+  evictManagedMirror() {}
 
   // Forward to ComObject<>::AddRefPrivate / ReleasePrivate on the
   // concrete leaf. Invariant: both call paths must touch the SAME counter

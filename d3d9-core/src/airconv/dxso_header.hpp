@@ -9,7 +9,7 @@ namespace dxmt {
 
 // DXSO header parser: reads version token at byte_code[0] and classifies it.
 // Used by Create{Vertex,Pixel}Shader to reject malformed bytecode at create
-// time. Header-only, no-LLVM; airconv will re-use for DXSO→AIR translation.
+// time. Header-only, no-LLVM; airconv will re-use for DXSO->AIR translation.
 
 enum class DxsoShaderKind : uint8_t {
   Vertex,
@@ -56,8 +56,8 @@ parse_dxso_header(const uint32_t *byte_code, size_t dword_count) {
   if (major < 1 || major > 3)
     return std::nullopt;
 
-  // Minor caps mirror DXVK d3d9_device.cpp: vs_1_x ≤ 1,
-  // ps_1_x ≤ 4, SM3 minor must be 0. SM2 minor is **deliberately
+  // Minor caps mirror DXVK d3d9_device.cpp: vs_1_x <= 1,
+  // ps_1_x <= 4, SM3 minor must be 0. SM2 minor is **deliberately
   // unchecked**: the FXC compiler emits 2_x / 2_a / 2_b profile
   // markers in the minor byte that aren't documented as discrete
   // values, and DXVK skips the check rather than enumerate them. We

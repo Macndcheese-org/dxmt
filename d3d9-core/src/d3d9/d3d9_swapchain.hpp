@@ -4,9 +4,8 @@
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "d3d9.h"
+#include "dxmt_hud_state.hpp"
 #include "rc/util_rc_ptr.hpp"
-
-#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +39,16 @@ public:
   MTLD3D9Surface *
   backBuffer() const {
     return m_backBuffers.empty() ? nullptr : m_backBuffers[0].ptr();
+  }
+
+  // The slot holding the most recently presented image, which is what
+  // GetFrontBufferData has to read. Rotation moves slot 0's content to the
+  // last slot, so the front buffer is the back of the chain rather than the
+  // front of it. DXVK answers the same question the same way, returning
+  // m_backBuffers.back() for exactly this reason.
+  MTLD3D9Surface *
+  frontBuffer() const {
+    return m_backBuffers.empty() ? nullptr : m_backBuffers.back().ptr();
   }
 
   // The window the chain blits to, as resolved by the interface layer
@@ -213,6 +222,11 @@ private:
   // params.hDeviceWindow / hFocusWindow before construction.
   // Null on headless chains.
   HWND m_hWindow = nullptr;
+  // Metal developer HUD heading, so a running title names which layer is
+  // serving it the way the d3d11 chain does. The properties object is a
+  // process-wide singleton; Metal shows the panel only when the HUD is
+  // enabled, so this costs nothing when it is not.
+  HUDState m_hud;
   // Shared presenter that owns the present_blit / present_scale PSOs and
   // does the scale-with-letterbox blit at Present time. Null on headless
   // chains (no m_layer). The dtor explicitly resets this before
@@ -229,13 +243,10 @@ private:
   // rate is otherwise sampled once at ctor and goes stale when the window is
   // dragged to a display with a different refresh rate.
   HMONITOR m_lastMonitor = nullptr;
-  // Display refresh rate the chain is on, queried at ctor via
-  // wsi::getCurrentDisplayMode(MonitorFromWindow) and re-probed by Present
-  // when m_lastMonitor changes. Drives the PresentationInterval=TWO/THREE/
-  // FOUR dwell math: apps that ask for 2× vsync on a 120Hz display want a
-  // 16.67 ms dwell (60 fps), not the 33.33 ms (30 fps) the prior
-  // 60Hz-hardcoded value gave them. Falls back to 60.0 on detection failure
-  // (headless smokes, monitor query returning zero, etc).
+  // Display refresh rate the chain is on. Drives the PresentationInterval
+  // TWO/THREE/FOUR dwell, which is a multiple of the real vblank interval
+  // rather than of an assumed 60 Hz. Falls back to 60.0 when the monitor
+  // query fails (headless chains).
   double m_refreshRateHz = 60.0;
   // Per-swapchain gamma ramp storage. Lazily initialized to identity
   // on first GetGammaRamp / SetGammaRamp. m_gammaSet tracks whether

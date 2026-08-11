@@ -12,8 +12,6 @@
 #include "d3d9_private_data.hpp"
 #include "d3d9_texture.hpp"
 #include "wsi_platform.hpp"
-
-#include <chrono>
 #include <cstring>
 
 namespace dxmt {
@@ -45,16 +43,14 @@ struct D3DKMT_DESTROYDCFROMMEMORY {
 LONG
 d3dkmtCreateDCFromMemory(D3DKMT_CREATEDCFROMMEMORY *arg) {
   using Fn = LONG(WINAPI *)(D3DKMT_CREATEDCFROMMEMORY *);
-  static Fn fn =
-      reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleA("gdi32.dll"), "D3DKMTCreateDCFromMemory"));
+  static Fn fn = reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleA("gdi32.dll"), "D3DKMTCreateDCFromMemory"));
   return fn ? fn(arg) : -1;
 }
 
 LONG
 d3dkmtDestroyDCFromMemory(const D3DKMT_DESTROYDCFROMMEMORY *arg) {
   using Fn = LONG(WINAPI *)(const D3DKMT_DESTROYDCFROMMEMORY *);
-  static Fn fn =
-      reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleA("gdi32.dll"), "D3DKMTDestroyDCFromMemory"));
+  static Fn fn = reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleA("gdi32.dll"), "D3DKMTDestroyDCFromMemory"));
   return fn ? fn(arg) : -1;
 }
 } // namespace
@@ -83,7 +79,7 @@ MTLD3D9Surface::MTLD3D9Surface(
   if (m_self_pinned)
     AddRefPrivate();
   // parentTextureType records what kind of texture this surface is a
-  // sub-resource of (Cube → 6 faces, 2D → 1 slice). Per-bind views are
+  // sub-resource of (Cube -> 6 faces, 2D -> 1 slice). Per-bind views are
   // now resolved off m_dxmtTexture via dxmt::Texture::createView, which
   // already knows the parent's type, so the surface only needs to cache
   // the metal pixel format here.
@@ -380,7 +376,8 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   D9DeviceLock lock = m_device->LockDevice();
   dxmt::perf::ScopedFrameDurationCounted _lock_timer(
       m_device->frameStats(), &dxmt::FrameStatistics::frame_resource_lock_interval,
-      &dxmt::FrameStatistics::frame_resource_lock_count);
+      &dxmt::FrameStatistics::frame_resource_lock_count
+  );
   if (!pLockedRect)
     return D3DERR_INVALIDCALL;
   // The caller's struct is written only on success: every INVALIDCALL return
@@ -420,7 +417,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // DISCARD + NOOVERWRITE: NOOVERWRITE wins.
   if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)) == (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
     Flags &= ~D3DLOCK_DISCARD;
-  // DOC-DIV (cosmetic): DXVK also strips DISCARD when the device is lost
+  // Divergence from DXVK: it also strips DISCARD when the device is lost
   // (d3d9_device.cpp LockImage); the buffer path does the same
   // (d3d9_buffer.cpp). Images do not, so a DISCARD lock of a lockable DEFAULT
   // RT / plain surface on a lost device skips the mirror readback below where
@@ -533,7 +530,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   m_ever_locked = true;
   ++m_lock_state->map_count;
   // Remember the locked rect + READONLY hint so UnlockRect can do a
-  // partial-extent replaceRegion (or skip it entirely on READONLY).
+  // partial-extent upload (or skip it entirely on READONLY).
   // wined3d texture.c d3d9_surface_unmap pushes only the dirty rect.
   m_locked_readonly = (Flags & D3DLOCK_READONLY) != 0;
   m_locked_no_dirty_update = (Flags & D3DLOCK_NO_DIRTY_UPDATE) != 0;
@@ -646,7 +643,9 @@ MTLD3D9Surface::UnlockRect() {
     // but next Lock could overwrite them (Apple Silicon UMA). Per-surface
     // rename ring on mirror would recover perf; follow-on work.
     const void *src = static_cast<const uint8_t *>(m_cpu_ptr) + src_offset;
-    m_device->stageTextureUpload(m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed);
+    m_device->stageTextureUpload(
+        m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed
+    );
     // The bytes are now snapshotted into the upload ring; the mirror is no
     // longer referenced. A MANAGED parent reclaims it once every level has
     // been uploaded (the level surfaces' cpu_ptr is nulled, so a later Lock
@@ -685,21 +684,23 @@ MTLD3D9Surface::GetDC(HDC *phdc) {
     static std::mutex seen_mutex;
     static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> seen;
     auto key = std::make_tuple(
-        static_cast<uint32_t>(m_desc.Pool), static_cast<uint32_t>(m_desc.Usage),
-        static_cast<uint32_t>(m_desc.Format), m_desc.Width, m_desc.Height
+        static_cast<uint32_t>(m_desc.Pool), static_cast<uint32_t>(m_desc.Usage), static_cast<uint32_t>(m_desc.Format),
+        m_desc.Width, m_desc.Height
     );
     std::lock_guard<std::mutex> guard(seen_mutex);
     if (seen.insert(key).second)
-      Logger::warn(str::format(
-          "d9 GetDC surface: pool=", static_cast<uint32_t>(m_desc.Pool), " usage=", m_desc.Usage,
-          " fmt=", static_cast<uint32_t>(m_desc.Format), " ", m_desc.Width, "x", m_desc.Height,
-          " lockable=", m_cpu_ptr ? 1 : 0, " hasTexture=", m_texture != nullptr ? 1 : 0,
-          " hasBuffer=", m_buffer != nullptr ? 1 : 0, " readsBack=",
-          (m_buffer == nullptr && m_texture != nullptr && m_desc.Pool == D3DPOOL_DEFAULT &&
-           !(m_desc.Usage & D3DUSAGE_DYNAMIC))
-              ? 1
-              : 0
-      ));
+      Logger::warn(
+          str::format(
+              "d9 GetDC surface: pool=", static_cast<uint32_t>(m_desc.Pool), " usage=", m_desc.Usage,
+              " fmt=", static_cast<uint32_t>(m_desc.Format), " ", m_desc.Width, "x", m_desc.Height,
+              " lockable=", m_cpu_ptr ? 1 : 0, " hasTexture=", m_texture != nullptr ? 1 : 0,
+              " hasBuffer=", m_buffer != nullptr ? 1 : 0, " readsBack=",
+              (m_buffer == nullptr && m_texture != nullptr && m_desc.Pool == D3DPOOL_DEFAULT &&
+               !(m_desc.Usage & D3DUSAGE_DYNAMIC))
+                  ? 1
+                  : 0
+          )
+      );
   }
 #ifdef _WIN32
   // GDI text composition: some apps rasterize UI text into a sampled texture by

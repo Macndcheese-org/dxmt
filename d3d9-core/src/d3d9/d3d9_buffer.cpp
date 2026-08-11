@@ -1,7 +1,5 @@
 #include "d3d9_buffer.hpp"
 
-#include <cstring>
-
 #include "d3d9_device.hpp"
 #include "d3d9_private_data.hpp"
 #include "d3d9_resource_priority.hpp"
@@ -12,7 +10,7 @@ namespace dxmt {
 
 namespace {
 
-// Lock(DISCARD) rename shared by the vertex and index buffers: recycle a
+// Refresh-time rename shared by the vertex and index buffers: recycle a
 // GPU-idle allocation (or mint one) and install it as the current
 // name. Metal returns a null buffer on video-memory exhaustion, and a placed
 // allocation keeps a non-null CPU pointer even then, so the plain immediate-
@@ -20,8 +18,13 @@ namespace {
 // allocation here, leaving the current name intact, so a null-backed name is
 // never installed (a later draw would bind a null MTLBuffer) and Lock reports
 // the failure instead of handing back a pointer into a dead allocation.
+//
+// coherent_seq must mean the GPU has completed through that seq, which is what
+// m_completionEvent reports and what the upload rings already recycle their
+// host blocks on. The refresh overwrites the recycled allocation with the CPU,
+// so a reader draw that is encoded but not yet retired would be torn.
 HRESULT
-discardRenameDynamicBuffer(MTLD3D9Device *device, DynamicBuffer *dynamic, uint64_t current_seq, uint64_t coherent_seq) {
+renameDynamicBuffer(MTLD3D9Device *device, DynamicBuffer *dynamic, uint64_t current_seq, uint64_t coherent_seq) {
   bool minted_fresh = false;
   auto fresh = dynamic->allocate(coherent_seq, &minted_fresh);
   if (!fresh.ptr() || !fresh->buffer())
@@ -50,13 +53,17 @@ MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
     m_usage(usage),
     m_fvf(fvf),
     m_pool(pool) {
-  // Wrap the underlying Buffer in the DynamicBuffer recycling wrapper (the
-  // same one d3d11 uses, d3d11_buffer.cpp:123). m_dxmtBuffer anchors the
-  // Buffer whose raw pointer the wrapper holds; the wrapper's initial name
-  // is the Buffer's current() allocation set at create time. The allocation
-  // is GPU-private: nothing the application touches is ever the allocation a
+  // Wrap the underlying Buffer in the DynamicBuffer recycling wrapper (the same
+  // one d3d11 uses, d3d11_buffer.cpp). m_dxmtBuffer anchors the Buffer
+  // whose raw pointer the wrapper holds; the wrapper's initial name is the
+  // Buffer's current() allocation set at create time. That allocation is
+  // CPU-writable, so a refresh stores the mirror into it without a staging
+  // block (d3d11 dynamic buffers use the same class), but it is Metal-owned and
+  // never handed out: nothing the application touches is ever the allocation a
   // draw reads (d3d9_buffer_map.hpp). A Lock(DISCARD) recycles a GPU-idle one.
-  m_dynamic = new dxmt::DynamicBuffer(m_dxmtBuffer.ptr(), BufferAllocationFlag::GpuPrivate);
+  // Every generation must carry this class, including the create-time one, or a
+  // store into an allocation that cannot be written is silently dropped.
+  m_dynamic = new dxmt::DynamicBuffer(m_dxmtBuffer.ptr(), BufferAllocationFlag::CpuWriteCombined);
   // A non-DEFAULT buffer is dirty over its whole extent from creation so its
   // first bind or Unlock uploads the mirror; DEFAULT contents are undefined
   // until the app writes them (DXVK d3d9_common_buffer.cpp).
@@ -90,26 +97,54 @@ void
 MTLD3D9VertexBuffer::refreshWholeMirror() {
   if (!m_dirty)
     return;
-  // Rename before copying. An earlier draw in this chunk may already be
+  // Rename before storing. An earlier draw in this chunk may already be
   // recorded against the current allocation, and overwriting it in place would
   // hand that draw contents it was never recorded with. A fresh allocation
   // leaves the old one intact for as long as those draws pin it, and the FIFO
   // recycles it once the GPU has provably passed them. This is the Metal
-  // dynamic-data idiom, and it also keeps the copy hoistable ahead of a render
-  // pass rather than forcing an encoder split to update memory mid-pass.
+  // dynamic-data idiom.
   //
   // The whole mirror goes, not a tracked span: the application does not
   // truthfully report what it wrote, and may still be writing.
-  // Taken before the rename below, not after; see StagingReservation.
-  auto reservation = m_device->reserveBufferUpload(m_size);
-  if (!reservation)
-    return;
-  if (FAILED(discardRenameDynamicBuffer(
+  //
+  // The cost this accepts, stated because every reference avoids it: a lock
+  // held across several draws pays a rename and a whole-mirror copy per draw,
+  // where wined3d reuses the client address with no upload for a coherent BO
+  // and DXVK's direct NOOVERWRITE path copies nothing. They can, because their
+  // lock pointer aliases the memory the draw reads; ours cannot alias it, so
+  // the mirror has to be carried across. Honouring the locked range instead
+  // was measured and refused: 36.6% of NOOVERWRITE refreshes write OUTSIDE the
+  // range the application declared.
+  if (FAILED(renameDynamicBuffer(
           m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
           m_device->m_cachedSignaled.load(std::memory_order_acquire)
-      )))
+      ))) {
+    // Video memory is exhausted, so the cache keeps the previous generation and
+    // the draw reads one refresh of stale geometry. Say so once: the failure is
+    // otherwise invisible, and stale vertices look like a rendering bug rather
+    // than an allocation one. Calling thread under the device lock.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+    }
     return;
-  m_device->commitBufferUpload(reservation, m_dynamic->immediateName(), 0, m_hostPtr, m_size);
+  }
+  // The name installed above is GPU-idle by construction, so it takes the
+  // mirror directly, the same shape d3d11's dynamic Unmap uses
+  // (d3d11_context_imm.cpp). Charged to the staging axis: this is the whole
+  // calling-thread cost of bringing the cache up to date, and the frontend
+  // total is only meaningful while every such copy lands on one of its terms.
+  // Where the allocation has no address this process can reach, the write
+  // crosses to the unix side instead of being a local memcpy, so the cost
+  // tracks refresh COUNT as much as bytes.
+  {
+    dxmt::perf::ScopedFrameDuration _upload_timer(
+        m_device->frameStats(), &dxmt::FrameStatistics::frame_staging_upload_interval
+    );
+    dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_staging_upload_bytes, m_size);
+    m_dynamic->immediateName()->updateContents(0, m_hostPtr, m_size, m_dynamic->immediateSuballocation());
+  }
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_bytes, m_size);
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_count, 1);
   // Still mapped means the application can write more before the next draw
@@ -249,36 +284,16 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
   // pool/usage does not honour before any of them take effect. No bounds
   // validation: the runtime neither clamps nor rejects OffsetToLock /
   // SizeToLock, the returned pointer is simply base + offset.
-  // A lost device ignores DISCARD (see isDeviceLost); strip it before sanitize
-  // so the rename path is never taken while lost.
-  if (m_device->isDeviceLost())
-    Flags &= ~D3DLOCK_DISCARD;
   Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
   // The lock pointer is the host mirror, disjoint from the GPU-read
   // allocation, so a Lock never waits and never returns WASSTILLDRAWING.
-  // On DISCARD, install a fresh current name from the DynamicBuffer:
-  // allocate() recycles a FIFO allocation the GPU has passed (will_free_at
-  // <= the signaled floor) or mints one, and updateImmediateName retires
-  // the old name tagged with the open cmdbuf's seq. The whole-buffer dirty
-  // span conjoined below re-uploads the mirror into the fresh name, while
-  // in-flight draws that froze the old allocation keep reading it
-  // undisturbed: it stays alive on those draws' captured Rc plus the FIFO
-  // entry and recycles only once provably GPU-idle. Without the fresh name
-  // the re-upload clobbers the same allocation a queued draw still reads
-  // (write-after-read tearing). Ports d3d11_context_imm.cpp
-  // MapDynamicBuffer's WRITE_DISCARD arm (minus the view rename d3d9
-  // buffers do not use). NOOVERWRITE / plain never rename: they write
-  // disjoint mirror bytes no in-flight draw reads.
+  // DISCARD therefore needs nothing done here. Its purpose is to let a driver
+  // hand back fresh storage rather than stall, and neither half applies: the
+  // application never touches the allocation, and the refresh that carries the
+  // mirror across renames unconditionally, so a name installed here would be
+  // retired by that rename without a single draw ever reading it.
   if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  if (Flags & D3DLOCK_DISCARD) {
-    if (HRESULT hr = discardRenameDynamicBuffer(
-            m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
-            m_device->m_cachedSignaled.load(std::memory_order_acquire)
-        );
-        FAILED(hr))
-      return hr;
-  }
   // A write lock stales the cache and nothing finer is recorded: the
   // application does not truthfully report which bytes it wrote, and may still
   // be writing after Unlock (d3d9_buffer_map.hpp).
@@ -333,8 +348,9 @@ MTLD3D9IndexBuffer::MTLD3D9IndexBuffer(
     m_format(format),
     m_pool(pool) {
   // See MTLD3D9VertexBuffer's ctor: wrap the underlying Buffer in the
-  // DynamicBuffer recycling wrapper over a GPU-private allocation.
-  m_dynamic = new dxmt::DynamicBuffer(m_dxmtBuffer.ptr(), BufferAllocationFlag::GpuPrivate);
+  // DynamicBuffer recycling wrapper over a CPU-writable, Metal-owned
+  // allocation.
+  m_dynamic = new dxmt::DynamicBuffer(m_dxmtBuffer.ptr(), BufferAllocationFlag::CpuWriteCombined);
   // See MTLD3D9VertexBuffer's ctor: a non-DEFAULT buffer starts wholly dirty.
   if (m_pool != D3DPOOL_DEFAULT)
     m_dirty = true;
@@ -355,26 +371,32 @@ void
 MTLD3D9IndexBuffer::refreshWholeMirror() {
   if (!m_dirty)
     return;
-  // Rename before copying. An earlier draw in this chunk may already be
-  // recorded against the current allocation, and overwriting it in place would
-  // hand that draw contents it was never recorded with. A fresh allocation
-  // leaves the old one intact for as long as those draws pin it, and the FIFO
-  // recycles it once the GPU has provably passed them. This is the Metal
-  // dynamic-data idiom, and it also keeps the copy hoistable ahead of a render
-  // pass rather than forcing an encoder split to update memory mid-pass.
-  //
-  // The whole mirror goes, not a tracked span: the application does not
-  // truthfully report what it wrote, and may still be writing.
-  // Taken before the rename below, not after; see StagingReservation.
-  auto reservation = m_device->reserveBufferUpload(m_size);
-  if (!reservation)
-    return;
-  if (FAILED(discardRenameDynamicBuffer(
+  // See MTLD3D9VertexBuffer::refreshWholeMirror: rename first, then the whole
+  // mirror rather than a span the application described.
+  if (FAILED(renameDynamicBuffer(
           m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
           m_device->m_cachedSignaled.load(std::memory_order_acquire)
-      )))
+      ))) {
+    // Video memory is exhausted, so the cache keeps the previous generation and
+    // the draw reads one refresh of stale geometry. Say so once: the failure is
+    // otherwise invisible, and stale vertices look like a rendering bug rather
+    // than an allocation one. Calling thread under the device lock.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+    }
     return;
-  m_device->commitBufferUpload(reservation, m_dynamic->immediateName(), 0, m_hostPtr, m_size);
+  }
+  // See MTLD3D9VertexBuffer::refreshWholeMirror for why the store goes straight
+  // into the fresh name and why it is charged to the staging axis.
+  {
+    dxmt::perf::ScopedFrameDuration _upload_timer(
+        m_device->frameStats(), &dxmt::FrameStatistics::frame_staging_upload_interval
+    );
+    dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_staging_upload_bytes, m_size);
+    m_dynamic->immediateName()->updateContents(0, m_hostPtr, m_size, m_dynamic->immediateSuballocation());
+  }
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_bytes, m_size);
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_buffer_refresh_count, 1);
   // Still mapped means the application can write more before the next draw
@@ -500,24 +522,10 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
   if (!ppbData)
     return D3DERR_INVALIDCALL;
   *ppbData = nullptr;
-  // A lost device ignores DISCARD (see isDeviceLost); strip it before sanitize
-  // so the rename path is never taken while lost.
-  if (m_device->isDeviceLost())
-    Flags &= ~D3DLOCK_DISCARD;
   Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
-  // On DISCARD, install a fresh current name from the DynamicBuffer; see
-  // MTLD3D9VertexBuffer::Lock for the recycle / write-after-read
-  // rationale and the old-allocation lifetime.
+  // See MTLD3D9VertexBuffer::Lock for why DISCARD needs nothing done here.
   if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  if (Flags & D3DLOCK_DISCARD) {
-    if (HRESULT hr = discardRenameDynamicBuffer(
-            m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
-            m_device->m_cachedSignaled.load(std::memory_order_acquire)
-        );
-        FAILED(hr))
-      return hr;
-  }
   // A write lock stales the cache and nothing finer is recorded: the
   // application does not truthfully report which bytes it wrote, and may still
   // be writing after Unlock (d3d9_buffer_map.hpp).

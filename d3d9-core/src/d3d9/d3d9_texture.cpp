@@ -47,7 +47,7 @@ buildLevelsAndMirror(
   // 3Dc is mappable regardless of pool or the dynamic flag (wined3d marks
   // the vendor FOURCCs MAPPABLE; wine's resource-access test locks a plain
   // DEFAULT ATI2 texture), so DEFAULT 3Dc rides the same mirror.
-  // DOC-DIV (vs DXVK): the RENDERTARGET/DEPTHSTENCIL exclusion below keeps the
+  // Divergence from DXVK: the RENDERTARGET/DEPTHSTENCIL exclusion below keeps the
   // DEFAULT-pool depth vendor FOURCCs (DF16/DF24/INTZ) unlockable. dxmt matches
   // the PRIMARY reference here (wined3d gives DS-usage textures no map access);
   // DXVK deliberately widened its IsVendorFormat arm to make every vendor FOURCC
@@ -94,7 +94,7 @@ buildLevelsAndMirror(
   // textures up front (boot-time atlas builds) avoid paying
   // wsi::aligned_malloc + memset + Metal newBuffer (wine_unix_call) per
   // texture before the data even exists. Per-Lock cost is the same;
-  // the win is on the cold-create path (audit M-PERF #2).
+  // the win is on the cold-create path.
   (void)total_bytes;
   (void)device;
   (void)mirrorBufferOut;
@@ -172,7 +172,9 @@ MTLD3D9Texture::MTLD3D9Texture(
     Rc<dxmt::Texture> texture, uint32_t bufferPitch, void *userMemory
 ) :
     m_device(device),
-    m_textureRaw(texture ? WMT::Reference<WMT::Texture>(texture->current()->texture()) : WMT::Reference<WMT::Texture>()),
+    m_textureRaw(
+        texture ? WMT::Reference<WMT::Texture>(texture->current()->texture()) : WMT::Reference<WMT::Texture>()
+    ),
     m_dxmtTexture(std::move(texture)),
     m_userMemory(userMemory != nullptr),
     m_usage(usage),
@@ -292,8 +294,12 @@ MTLD3D9Texture::ensureMirror() {
 }
 
 // An app that reads a MANAGED texture back more than this many times keeps its
-// mirror resident: re-downloading on every read would thrash. Mirrors wined3d's
-// download_count > WINED3D_TEXTURE_DYNAMIC_MAP_THRESHOLD guard in evict_sysmem.
+// mirror resident: re-downloading on every read would thrash. Same shape as
+// wined3d's download_count guard in evict_sysmem, deliberately far lower than
+// its threshold of 50, because the two downloads do not cost the same: wined3d
+// reads back from a mapped resource, while re-materializing a level here drains
+// the draw batch and waits on the GPU, so the point where pinning the mirror
+// wins arrives much sooner.
 static constexpr uint32_t kMirrorReadEvictThreshold = 4;
 
 void
@@ -557,7 +563,7 @@ MTLD3D9Texture::Release() {
     // keeps the device alive, then release the pin, which may now free it.
     MTLD3D9Device *device = m_device;
     // Drop the ctor self-pin exactly once, matching MTLD3D9Surface.
-    // Subsequent pub Get→Release cycles must NOT call ReleasePrivate
+    // Subsequent pub Get->Release cycles must NOT call ReleasePrivate
     // again; m_textures[N] / m_levels surface containers etc. may
     // still hold their own priv refs, and over-decrementing kills the
     // object out from under them.
@@ -766,12 +772,11 @@ MTLD3D9Texture::AddDirtyRect(const RECT *pDirtyRect) {
   // UpdateTexture consumer clamps the region (no memory hazard), so this is a
   // pure HR-correctness fix toward the primary reference. Storage is a single
   // union RECT at level-0 coordinates; UpdateTexture scales it down per-level.
-  if (pDirtyRect &&
-      !image_box_dimensions_valid(
-          static_cast<uint32_t>(pDirtyRect->left), static_cast<uint32_t>(pDirtyRect->top),
-          static_cast<uint32_t>(pDirtyRect->right), static_cast<uint32_t>(pDirtyRect->bottom), 0, 1, m_width, m_height,
-          1, D3DFormatBlockWidth(m_format), D3DFormatBlockHeight(m_format)
-      ))
+  if (pDirtyRect && !image_box_dimensions_valid(
+                        static_cast<uint32_t>(pDirtyRect->left), static_cast<uint32_t>(pDirtyRect->top),
+                        static_cast<uint32_t>(pDirtyRect->right), static_cast<uint32_t>(pDirtyRect->bottom), 0, 1,
+                        m_width, m_height, 1, D3DFormatBlockWidth(m_format), D3DFormatBlockHeight(m_format)
+                    ))
     return D3DERR_INVALIDCALL;
   unionDirtyRect(pDirtyRect);
   // MANAGED sampled texture: AddDirtyRect re-uploads the marked region from the

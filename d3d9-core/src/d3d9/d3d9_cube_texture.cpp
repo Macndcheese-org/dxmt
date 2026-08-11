@@ -39,10 +39,9 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
   // byte offset of that face/level's first row. A D3DUSAGE_DYNAMIC DEFAULT
   // cube is lockable every frame the same as a DYNAMIC 2D texture, so it gets
   // the same sysmem mirror; RT/DS DEFAULT cubes stay GPU-only.
-  const bool needs_mirror =
-      pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
-      (pool == D3DPOOL_DEFAULT && ((usage & D3DUSAGE_DYNAMIC) || Is3DcFormat(format)) &&
-       !(usage & D3DUSAGE_RENDERTARGET) && !(usage & D3DUSAGE_DEPTHSTENCIL));
+  const bool needs_mirror = pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
+                            (pool == D3DPOOL_DEFAULT && ((usage & D3DUSAGE_DYNAMIC) || Is3DcFormat(format)) &&
+                             !(usage & D3DUSAGE_RENDERTARGET) && !(usage & D3DUSAGE_DEPTHSTENCIL));
   const size_t total_subresources = static_cast<size_t>(6) * levels;
   m_mirrorOffsets.resize(total_subresources + 1u);
   size_t total_bytes = 0;
@@ -94,7 +93,6 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
       desc.MultiSampleQuality = 0;
       desc.Width = level_dim;
       desc.Height = level_dim;
-
 
       auto *level = new MTLD3D9Surface(
           m_device, desc,
@@ -508,12 +506,11 @@ MTLD3D9CubeTexture::AddDirtyRect(D3DCUBEMAP_FACES FaceType, const RECT *pDirtyRe
   // consumer clamps, so this is HR-correctness only.
   if (static_cast<uint32_t>(FaceType) >= 6)
     return D3DERR_INVALIDCALL;
-  if (pDirtyRect &&
-      !image_box_dimensions_valid(
-          static_cast<uint32_t>(pDirtyRect->left), static_cast<uint32_t>(pDirtyRect->top),
-          static_cast<uint32_t>(pDirtyRect->right), static_cast<uint32_t>(pDirtyRect->bottom), 0, 1, m_edge_length,
-          m_edge_length, 1, D3DFormatBlockWidth(m_format), D3DFormatBlockHeight(m_format)
-      ))
+  if (pDirtyRect && !image_box_dimensions_valid(
+                        static_cast<uint32_t>(pDirtyRect->left), static_cast<uint32_t>(pDirtyRect->top),
+                        static_cast<uint32_t>(pDirtyRect->right), static_cast<uint32_t>(pDirtyRect->bottom), 0, 1,
+                        m_edge_length, m_edge_length, 1, D3DFormatBlockWidth(m_format), D3DFormatBlockHeight(m_format)
+                    ))
     return D3DERR_INVALIDCALL;
   unionDirtyRect(static_cast<uint32_t>(FaceType), pDirtyRect);
   return D3D_OK;

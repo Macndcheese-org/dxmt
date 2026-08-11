@@ -19,11 +19,11 @@ namespace dxmt {
 
 class MTLD3D9Device;
 
-// IDirect3DCubeTexture9: one TextureCube (6 faces × N mips) with
-// 6×N pre-created MTLD3D9Surface views. Faces share WMT::Texture;
+// IDirect3DCubeTexture9: one TextureCube (6 faces x N mips) with
+// 6xN pre-created MTLD3D9Surface views. Faces share WMT::Texture;
 // mipLevel+arraySlice select render-pass attachments/samplers.
-// Non-DEFAULT pools: per-face/level sysmem mirror. MANAGED unlocks
-// push data via replaceRegion. References: wined3d texture.c.
+// Non-DEFAULT pools: per-face/level sysmem mirror, staged to the texture by the
+// unlock. References: wined3d texture.c.
 class MTLD3D9CubeTexture final : public ComObject<IDirect3DCubeTexture9>,
                                  public MTLD3D9CommonTexture,
                                  public D9LazyMirrorHost {
@@ -79,7 +79,7 @@ public:
     return m_texture->current()->texture();
   }
   // See MTLD3D9Texture::dxmtTexture; chunk lambdas capture this Rc<>
-  // to keep the cube alive across the calling-thread → encode-thread
+  // to keep the cube alive across the calling-thread -> encode-thread
   // boundary.
   const Rc<dxmt::Texture> &
   dxmtTexture() const override {
@@ -169,9 +169,9 @@ public:
   clearMipsDirty() override {
     m_mips_dirty.store(false, std::memory_order_release);
   }
-  // See MTLD3D9Texture::flagAutoGenDirty for rationale: StretchRect-
-  // as-dest of an AUTOGENMIPMAP cube routes through here for the same
-  // lazy-flag protocol UnlockRect uses. Returns whether it marked dirty.
+  // See MTLD3D9Texture::flagAutoGenDirty for rationale: StretchRect-as-dest of
+  // an AUTOGENMIPMAP cube routes through here for the same lazy-flag protocol
+  // UnlockRect uses.
   bool
   flagAutoGenDirty() {
     if (!(m_usage & D3DUSAGE_AUTOGENMIPMAP))
@@ -195,7 +195,7 @@ private:
   // NSObject survives any single dxmt::Texture rename; see
   // MTLD3D9Texture's m_texture comment for the full lifetime rationale.
   Rc<dxmt::Texture> m_texture;
-  // 6 × N face/level surface views. Layout is face-major: face 0
+  // 6 x N face/level surface views. Layout is face-major: face 0
   // takes m_levels[0..N-1], face 1 takes m_levels[N..2N-1], etc.
   // Same eager-creation rationale as MTLD3D9Texture; GetCubeMapSurface
   // must return the same surface object across calls, and the lookup
@@ -205,7 +205,7 @@ private:
   // Texture-wide Lock/GetDC coordination shared by every face/level surface
   // (wined3d resource.map_count). Each surface is pointed at this in the ctor.
   D3D9SurfaceLockState m_shared_lock_state;
-  // Sysmem mirror for non-DEFAULT pools, sized for 6 faces × N
+  // Sysmem mirror for non-DEFAULT pools, sized for 6 faces x N
   // levels. Layout matches m_levels: face-major, then level. Per-
   // face/level offset table; total bytes at m_mirrorOffsets.back().
   // Allocated lazily on first Lock (ensureMirror) and reclaimed for
@@ -237,7 +237,7 @@ private:
   // AUTOGENMIPMAP lazy-flush bit; see MTLD3D9Texture::m_mips_dirty.
   std::atomic<bool> m_mips_dirty{false};
   // Per-face dirty tracking. Each face has its own union RECT in
-  // level-0 coordinates; defaults to (true, full edge×edge) so a
+  // level-0 coordinates; defaults to (true, full edge x edge) so a
   // freshly-created cube uploads everything on first consume.
   bool m_dirty_any[6] = {true, true, true, true, true, true};
   RECT m_dirty_rect[6] = {};

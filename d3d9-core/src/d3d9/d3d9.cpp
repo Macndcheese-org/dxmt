@@ -89,11 +89,11 @@ typedef HRESULT(WINAPI *shader_validator_cb)(
 );
 
 enum shader_validator_state {
-  SV_BEGIN = 0,   // awaiting Begin
-  SV_HEADER,      // Begin done, awaiting the version token
-  SV_BODY,        // version accepted, validating instructions
-  SV_END_TOKEN,   // end token seen, awaiting End
-  SV_ERROR,       // a fatal error latched; only a fresh validator recovers
+  SV_BEGIN = 0, // awaiting Begin
+  SV_HEADER,    // Begin done, awaiting the version token
+  SV_BODY,      // version accepted, validating instructions
+  SV_END_TOKEN, // end token seen, awaiting End
+  SV_ERROR,     // a fatal error latched; only a fresh validator recovers
 };
 
 // Message ids match the values the wine d3d9 test pins against native for the
@@ -171,8 +171,10 @@ shader_validator_Begin(IDirect3DShaderValidator9 *v, shader_validator_cb callbac
   // to SV_BEGIN. A second Begin mid-stream, or one after a latched error, is out
   // of order: report it and latch, so only ::End or a fresh validator recovers.
   if (v->state != SV_BEGIN) {
-    shader_validator_emit(v, nullptr, 0, SVM_BEGIN_OUT_OF_ORDER,
-                          "IDirect3DShaderValidator9::Begin called out of order. ::End must be called first.");
+    shader_validator_emit(
+        v, nullptr, 0, SVM_BEGIN_OUT_OF_ORDER,
+        "IDirect3DShaderValidator9::Begin called out of order. ::End must be called first."
+    );
     v->state = SV_ERROR;
     return E_FAIL;
   }
@@ -185,20 +187,26 @@ shader_validator_Instruction(
     IDirect3DShaderValidator9 *v, const char *file, int line, const DWORD *tokens, unsigned int token_count
 ) {
   if (!tokens || !token_count) {
-    shader_validator_emit(v, file, line, SVM_INSTRUCTION_NULL_ARGS,
-                          "IDirect3DShaderValidator9::Instruction called with NULL tokens or a zero token count.");
+    shader_validator_emit(
+        v, file, line, SVM_INSTRUCTION_NULL_ARGS,
+        "IDirect3DShaderValidator9::Instruction called with NULL tokens or a zero token count."
+    );
     return E_FAIL;
   }
   if (v->state == SV_ERROR)
     return E_FAIL;
   if (v->state == SV_BEGIN) {
-    shader_validator_emit(v, file, line, SVM_INSTRUCTION_OUT_OF_ORDER,
-                          "IDirect3DShaderValidator9::Instruction called out of order. ::Begin must be called first.");
+    shader_validator_emit(
+        v, file, line, SVM_INSTRUCTION_OUT_OF_ORDER,
+        "IDirect3DShaderValidator9::Instruction called out of order. ::Begin must be called first."
+    );
     return E_FAIL;
   }
   if (v->state == SV_END_TOKEN) {
-    shader_validator_emit(v, file, line, SVM_INSTRUCTION_AFTER_END,
-                          "IDirect3DShaderValidator9::Instruction called after the end token. Call ::End next.");
+    shader_validator_emit(
+        v, file, line, SVM_INSTRUCTION_AFTER_END,
+        "IDirect3DShaderValidator9::Instruction called after the end token. Call ::End next."
+    );
     return E_FAIL;
   }
   if (v->state == SV_HEADER) {
@@ -207,14 +215,18 @@ shader_validator_Instruction(
     // file: the length arm carries line -1, the type arm line 0.
     bool bad = false;
     if (token_count != 1) {
-      shader_validator_emit(v, nullptr, -1, SVM_BAD_VERSION_LENGTH,
-                            "IDirect3DShaderValidator9::Instruction: bad version token, expected a single DWORD.");
+      shader_validator_emit(
+          v, nullptr, -1, SVM_BAD_VERSION_LENGTH,
+          "IDirect3DShaderValidator9::Instruction: bad version token, expected a single DWORD."
+      );
       bad = true;
     }
     const DWORD kind = tokens[0] & 0xffff0000u;
     if (kind != 0xffff0000u && kind != 0xfffe0000u) {
-      shader_validator_emit(v, nullptr, 0, SVM_BAD_VERSION_TYPE,
-                            "IDirect3DShaderValidator9::Instruction: bad version token, neither a pixel nor a vertex shader.");
+      shader_validator_emit(
+          v, nullptr, 0, SVM_BAD_VERSION_TYPE,
+          "IDirect3DShaderValidator9::Instruction: bad version token, neither a pixel nor a vertex shader."
+      );
       bad = true;
     }
     if (bad) {
@@ -228,8 +240,10 @@ shader_validator_Instruction(
   // SV_BODY. The end token closes the stream.
   if (tokens[0] == 0x0000ffffu) {
     if (token_count != 1) {
-      shader_validator_emit(v, file, line, SVM_BAD_END_TOKEN,
-                            "IDirect3DShaderValidator9::Instruction: bad end token, expected a single DWORD.");
+      shader_validator_emit(
+          v, file, line, SVM_BAD_END_TOKEN,
+          "IDirect3DShaderValidator9::Instruction: bad end token, expected a single DWORD."
+      );
       v->state = SV_ERROR;
       return E_FAIL;
     }
@@ -247,9 +261,10 @@ shader_validator_Instruction(
       const DWORD reg_type = ((tokens[i] & 0x70000000u) >> 28) | ((tokens[i] & 0x00001800u) >> 8);
       const DWORD reg_index = tokens[i] & 0x000007ffu;
       if (reg_type == 1u /* D3DSPR_INPUT */ && reg_index >= 10u) {
-        shader_validator_emit(v, file, line,
-                              opcode == 0x1fu /* dcl */ ? SVM_BAD_INPUT_REGISTER_DECL : SVM_BAD_INPUT_REGISTER,
-                              "IDirect3DShaderValidator9::Instruction: pixel shader input register index out of range.");
+        shader_validator_emit(
+            v, file, line, opcode == 0x1fu /* dcl */ ? SVM_BAD_INPUT_REGISTER_DECL : SVM_BAD_INPUT_REGISTER,
+            "IDirect3DShaderValidator9::Instruction: pixel shader input register index out of range."
+        );
         break;
       }
     }
@@ -261,13 +276,16 @@ shader_validator_End(IDirect3DShaderValidator9 *v) {
   if (v->state == SV_ERROR)
     return E_FAIL;
   if (v->state == SV_BEGIN) {
-    shader_validator_emit(v, nullptr, 0, SVM_END_OUT_OF_ORDER,
-                          "IDirect3DShaderValidator9::End called out of order. ::Begin must be called first.");
+    shader_validator_emit(
+        v, nullptr, 0, SVM_END_OUT_OF_ORDER,
+        "IDirect3DShaderValidator9::End called out of order. ::Begin must be called first."
+    );
     return E_FAIL;
   }
   if (v->state != SV_END_TOKEN) {
-    shader_validator_emit(v, nullptr, 0, SVM_MISSING_END_TOKEN,
-                          "IDirect3DShaderValidator9::End: the shader is missing its end token.");
+    shader_validator_emit(
+        v, nullptr, 0, SVM_MISSING_END_TOKEN, "IDirect3DShaderValidator9::End: the shader is missing its end token."
+    );
     v->state = SV_BEGIN;
     return E_FAIL;
   }

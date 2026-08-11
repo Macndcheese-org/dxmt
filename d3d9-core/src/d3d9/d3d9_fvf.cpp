@@ -148,8 +148,8 @@ derive_fvf_from_elements(const D3DVERTEXELEMENT9 *elements, size_t count) {
   // A lone position element in the canonical slot converts; anything else
   // (extra elements, a nonzero stream/offset/method/usage index, or any other
   // usage) reports 0. count == 2 is one vertex element plus D3DDECL_END.
-  if (count != 2 || elements[0].Stream != 0 || elements[0].Offset != 0 ||
-      elements[0].Method != D3DDECLMETHOD_DEFAULT || elements[0].UsageIndex != 0)
+  if (count != 2 || elements[0].Stream != 0 || elements[0].Offset != 0 || elements[0].Method != D3DDECLMETHOD_DEFAULT ||
+      elements[0].UsageIndex != 0)
     return 0;
   if (elements[0].Type == D3DDECLTYPE_FLOAT3 && elements[0].Usage == D3DDECLUSAGE_POSITION)
     return D3DFVF_XYZ;

@@ -19,13 +19,13 @@ D3DFormatToMetal(D3DFORMAT format, D3D9FormatUsage usage) {
   // on read, matching D3D9's "X is ignored on read, undefined on
   // write" contract for X8R8G8B8). A8R8G8B8 carries a real alpha
   // channel and uses the plain BGRA8 alias. Reference:
-  // MGL/MGLTextures.m line ~140 (UNSIGNED_INT_8_8_8_8 / BGRA → BGRA8).
+  // MGL/MGLTextures.m line ~140 (UNSIGNED_INT_8_8_8_8 / BGRA -> BGRA8).
   case D3DFMT_X8R8G8B8:
     return usage == D3D9FormatUsage::DepthStencil ? WMTPixelFormatInvalid : WMTPixelFormatBGRX8Unorm;
   case D3DFMT_A8R8G8B8:
     return usage == D3D9FormatUsage::DepthStencil ? WMTPixelFormatInvalid : WMTPixelFormatBGRA8Unorm;
 
-  // A8B8G8R8 → RGBA8Unorm (channel order matches Metal's R-first
+  // A8B8G8R8 -> RGBA8Unorm (channel order matches Metal's R-first
   // layout). Metal lacks an RGBX variant, so X8B8G8R8 reuses RGBA8;
   // the sampler swizzle table forces its alpha reads to 1.
   case D3DFMT_X8B8G8R8:
@@ -145,7 +145,7 @@ D3DFormatToMetal(D3DFORMAT format, D3D9FormatUsage usage) {
   case D3DFMT_D32_LOCKABLE:
     return usage == D3D9FormatUsage::RenderTarget ? WMTPixelFormatInvalid : WMTPixelFormatDepth32Float;
 
-  // BC-compressed: DXT1→BC1, DXT2/3→BC2, DXT4/5→BC3. Sampler-only;
+  // BC-compressed: DXT1->BC1, DXT2/3->BC2, DXT4/5->BC3. Sampler-only;
   // Apple Silicon rejects as render-targets at descriptor validation.
   case D3DFMT_DXT1:
     return usage != D3D9FormatUsage::SampleableTexture ? WMTPixelFormatInvalid : WMTPixelFormatBC1_RGBA;
@@ -214,6 +214,10 @@ D3DFormatBytesPerPixel(D3DFORMAT format) {
   case D3DFMT_R16F:
   case D3DFMT_D16:
   case D3DFMT_D16_LOCKABLE:
+  // The pitch is the app-facing D3D9 layout, not the Metal storage: D15S1 is a
+  // 16-bit surface to a caller even though its stencil aspect makes it alias
+  // onto a wider combined format (see D3DFormatToMetal).
+  case D3DFMT_D15S1:
   // FOURCC depth aliases. Apps don't normally LockRect these (the
   // point is GPU-side sampling), but a software-readback path needs a
   // stride.
@@ -251,6 +255,7 @@ D3DFormatBytesPerPixel(D3DFORMAT format) {
   case D3DFMT_D24FS8:
   case D3DFMT_D32:
   case D3DFMT_D32F_LOCKABLE:
+  case D3DFMT_D32_LOCKABLE:
   // INTZ apparent BPP is 4 (24-bit depth + 8-bit stencil) per wined3d
   // utils.c, but Apple Metal aliases the storage onto
   // Depth32Float_Stencil8: actually 8 bytes per texel. Today this
@@ -278,13 +283,13 @@ uint32_t
 D3DFormatRowPitch(D3DFORMAT format, uint32_t width) {
   switch (format) {
   case D3DFMT_DXT1:
-    // 8 bytes per 4×4 block.
+    // 8 bytes per 4x4 block.
     return ((width + 3u) / 4u) * 8u;
   case D3DFMT_DXT2:
   case D3DFMT_DXT3:
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
-    // 16 bytes per 4×4 block.
+    // 16 bytes per 4x4 block.
     return ((width + 3u) / 4u) * 16u;
   default: {
     uint32_t bpp = D3DFormatBytesPerPixel(format);
@@ -726,9 +731,9 @@ D3DFormatSamplerSwizzle(D3DFORMAT format) {
     // Depth-as-texture: Metal returns scalar red; replicate across RGBA
     // at view level for apps reading .gggg or .yyyy (soft-particle fades).
     // INTZ = RRRR is 3-way confirmed (d9vk INTZ swizzle RRRR; wined3d "XXXX"
-    // fixup utils.c). DOC-DIV (C2-O10, refs split) for DF16/DF24: d9vk + DXVK
-    // use (R,0,0,1), but wined3d has no DF16/DF24 support at all (grep: zero
-    // hits), so there is no primary to break the tie and ATI hardware behavior
+    // fixup utils.c). a deliberate divergence for DF16/DF24: d9vk + DXVK
+    // use (R,0,0,1), but wined3d has no DF16/DF24 support at all, so there is
+    // no primary to break the tie and ATI hardware behavior
     // is the only oracle. Held as RRRR (consistent with INTZ) pending a
     // native/ATI-hardware oracle.
     return {WMTTextureSwizzleRed, WMTTextureSwizzleRed, WMTTextureSwizzleRed, WMTTextureSwizzleRed};

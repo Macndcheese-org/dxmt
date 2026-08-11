@@ -26,9 +26,9 @@ Is3DcFormat(D3DFORMAT format) {
   return format == D3DFMT_ATI1 || format == D3DFMT_ATI2;
 }
 
-// D3DFORMAT → MTLPixelFormat lowering. Returns WMTPixelFormatInvalid for
+// D3DFORMAT -> MTLPixelFormat lowering. Returns WMTPixelFormatInvalid for
 // unsupported formats. Usage argument selects alias for ambiguous formats
-// (e.g. D24S8 → D32FS8 for DS, typeless for texture). Apple Silicon:
+// (e.g. D24S8 -> D32FS8 for DS, typeless for texture). Apple Silicon:
 // D3DFMT_D24S8 must alias to Depth32Float_Stencil8.
 enum class D3D9FormatUsage {
   RenderTarget,
@@ -45,7 +45,8 @@ WMTPixelFormat D3DFormatToMetal(D3DFORMAT format, D3D9FormatUsage usage);
 // would sample that stored byte instead of the spec-mandated 1.0. On a
 // render target with no alpha channel D3D9 hardware degenerates DESTALPHA to
 // one and INVDESTALPHA to zero; the blend translator normalises them for
-// these targets. Reference: d9vk d3d9_device.cpp (m_alphaSwizzleRTs).
+// these targets. DXVK tracks the same property per render-target slot as
+// hasAlphaSwizzle and folds it into its blend state.
 bool D3DFormatHasNoAlpha(D3DFORMAT format);
 
 // Bytes per pixel for tightly-packed surface formats. Used by LockRect
@@ -54,10 +55,10 @@ bool D3DFormatHasNoAlpha(D3DFORMAT format);
 uint32_t D3DFormatBytesPerPixel(D3DFORMAT format);
 
 // Bytes per row of texels for the given format and width. For DXT-
-// compressed formats this is bytes per row of 4×4 BLOCKS, with the
+// compressed formats this is bytes per row of 4x4 BLOCKS, with the
 // width rounded up to a multiple of 4 first. Returns 0 for unsupported
 // formats. Used by MANAGED-pool LockRect mirror sizing and by the
-// replaceRegion bytesPerRow argument on UnlockRect.
+// bytes-per-row argument the unlock upload passes.
 uint32_t D3DFormatRowPitch(D3DFORMAT format, uint32_t width);
 
 // The LockRect pitch the D3D9 runtime reports to apps: the tight row
@@ -70,7 +71,7 @@ uint32_t D3DFormatRowPitch(D3DFORMAT format, uint32_t width);
 uint32_t D3DFormatLockPitch(D3DFORMAT format, uint32_t width);
 
 // Number of rows in a level of the given format and height. For DXT
-// formats this is rows of 4×4 BLOCKS (height rounded up to a multiple
+// formats this is rows of 4x4 BLOCKS (height rounded up to a multiple
 // of 4 then divided by 4). For uncompressed formats this is just
 // height. Returns 0 for unsupported formats.
 uint32_t D3DFormatRowCount(D3DFORMAT format, uint32_t height);
@@ -104,7 +105,7 @@ bool IsMetalNonFilterableFormat(D3DFORMAT format);
 // future commit) and can't be render-targets on Apple Silicon; both
 // CreateTexture and CreateOffscreenPlainSurface gate their RT-usage
 // promotion off this. Apple Metal also rejects compressed mip levels
-// below 4×4; the clamp hasn't been needed yet: when a caller passes
+// below 4x4; the clamp hasn't been needed yet: when a caller passes
 // Levels=0 against a compressed format, this is the place to add
 // `max_levels = log2(max(W,H)/4) + 1`.
 bool IsCompressedFormat(D3DFORMAT format);
@@ -174,7 +175,7 @@ float DepthBiasScale(D3DFORMAT format);
 
 // True for the 'NULL' FOURCC sentinel: a colour render-target slot
 // the app binds but never writes (shadow-map depth-only passes are
-// the canonical shape: bind a 1×1 NULL RT alongside the real DS and
+// the canonical shape: bind a 1x1 NULL RT alongside the real DS and
 // rasterise with COLORWRITEENABLE = 0). The format has no Metal
 // pixel-format equivalent; render-pass build and PSO build both skip
 // the slot.
@@ -212,19 +213,29 @@ bool IsFloatColorFormat(D3DFORMAT format);
 bool IsVolumeTextureFormat(D3DFORMAT format);
 
 // True for a D3D9 format whose Metal storage HAS an sRGB sibling that must not
-// be used for D3DSAMP_SRGBTEXTURE / D3DUSAGE_QUERY_SRGBREAD, because that
-// sibling would gamma-decode a non-color lane. The only such format is
-// D3DFMT_A8L8: it lowers to RG8Unorm, whose RG8Unorm_sRGB sibling decodes BOTH
+// be used for D3DSAMP_SRGBTEXTURE / D3DUSAGE_QUERY_SRGBREAD, because Metal
+// would offer a gamma-decoding sibling the reference implementations do not.
+//
+// D3DFMT_A8L8 lowers to RG8Unorm, whose RG8Unorm_sRGB sibling decodes BOTH
 // lanes including the alpha stored in G, whereas native D3D9 (GL
 // sLUMINANCE8_ALPHA8) and DXVK decode luminance only and give A8L8 no sRGB pair.
+//
+// D3DFMT_L8 lowers to R8Unorm, which does have an R8Unorm_sRGB sibling, but the
+// luminance formats carry no sRGB pair on the paths the references settled on:
+// DXVK maps L8 to an undefined sRGB format outright, and wined3d's modern R8
+// path leaves both its internal formats linear (only its legacy GL_LUMINANCE8
+// entry names an sRGB format). Left aliased, a title that enables
+// D3DSAMP_SRGBTEXTURE across all stages gamma-decodes its light maps and gloss
+// and mask textures, which is a brightness error precisely where nobody looks.
+//
 // The SRGBREAD probe, the sample-bind sRGB alias and the PixelFormatView create
-// hint all consult this so dxmt advertises and realizes A8L8 with no sRGB read,
+// hint all consult this so dxmt advertises and realizes these with no sRGB read,
 // matching the references. Kept a pure D3DFORMAT predicate (no Recall_sRGB call)
 // so the format layer stays host-linkable; callers still apply Recall_sRGB to
 // obtain the aliased format for every other format.
 inline bool
 D3D9FormatSuppressSRGBRead(D3DFORMAT format) {
-  return format == D3DFMT_A8L8;
+  return format == D3DFMT_A8L8 || format == D3DFMT_L8;
 }
 
 } // namespace dxmt

@@ -12,8 +12,8 @@ namespace dxmt {
 // include.
 
 // Resolve spec-permitted "use the runtime default" placeholders
-// (BackBufferCount=0 → 1; BackBufferFormat=UNKNOWN → X8R8G8B8;
-// AutoDepthStencilFormat=UNKNOWN → D24S8; Windowed + zero extent →
+// (BackBufferCount=0 -> 1; BackBufferFormat=UNKNOWN -> X8R8G8B8;
+// AutoDepthStencilFormat=UNKNOWN -> D24S8; Windowed + zero extent ->
 // GetClientRect of hwndFallback, 8px floor). Mutates p in place.
 // Returns false on a value that's invalid in a way PresentParamsRejectReason
 // doesn't catch (unmappable BackBufferFormat, zero extent on a hwndless

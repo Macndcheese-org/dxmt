@@ -1,3 +1,9 @@
+// DXVK citations in this file name its DXSO compiler as it stood at the
+// revision this translator was read against (src/dxso/). Upstream has since
+// rewritten that path into the dxbc-spirv subproject, where those function
+// names no longer resolve, so read a citation as the approach it describes
+// rather than as a file to open. The behaviour each one attributes was checked
+// against the DXVK it names.
 #include "dxso_compile.hpp"
 #include "ffp_compile.hpp"
 
@@ -206,7 +212,7 @@ compile_dxso(
         continue;
       if (manual_fetch) {
         // Look up the IA element whose `reg` matches this v#. The d3d9
-        // caller resolves (decl semantic, VS dcl) → reg before
+        // caller resolves (decl semantic, VS dcl) -> reg before
         // populating the layout, so a matched element is the
         // expected case; an unmatched dcl falls through to zero-fill,
         // which mirrors the "undcl'd input is zero" DXSO contract.
@@ -714,8 +720,8 @@ compile_dxso(
     // sampler tokens; wined3d glsl_shader.c
     // shader_glsl_get_sample_function and DXVK src/dxso/dxso_compiler.cpp
     // both assume 2D when the bytecode itself can't disambiguate. Without
-    // either source, samp_kind[i] stays Unknown → the binding loop below
-    // `continue`s → tex_arg_idx[i] stays -1 → the Tex opcode short-
+    // either source, samp_kind[i] stays Unknown -> the binding loop below
+    // `continue`s -> tex_arg_idx[i] stays -1 -> the Tex opcode short-
     // circuits and r0 sees the raw TEXCOORD<n> stage_in instead of the
     // sampled texel (UV-as-color gradient).
     if (shader->header.major == 1) {
@@ -776,7 +782,7 @@ compile_dxso(
     }
   }
 
-  // VS varying outputs: pre-scan SM≤2 for oD#/oT# writes, SM3 reads dcl.
+  // VS varying outputs: pre-scan SM<=2 for oD#/oT# writes, SM3 reads dcl.
   // SM1/SM2 semantics positional; SM3 uses dcl. OutputPosition first.
   std::array<int, 2> oD_arg_idx{};
   oD_arg_idx.fill(-1);
@@ -808,7 +814,7 @@ compile_dxso(
   // SM3 VS outputs: `dcl_<usage> o#` registers, dcl-driven semantics.
   // Output # is the dcl's bound_to.num; usage gives the AIR user name.
   // o#'s register file decodes as TexcoordOut/Output (=6); same
-  // numeric value, distinct meaning. -1 unbound, ≥ 0 is the
+  // numeric value, distinct meaning. -1 unbound, >= 0 is the
   // OutputVertex arg index. oN_is_position aliases the slot to oPos
   // for Position dcls so the existing field-0 plumbing covers them.
   std::array<int, 16> oN_arg_idx{};
@@ -995,7 +1001,7 @@ compile_dxso(
       // semantically writes [[depth]]. Treat their presence as a
       // depth-output declaration too so the OutputDepth signature
       // entry + slot get allocated. wined3d glsl_shader.c +
-      // :6563 emit `gl_FragDepth = …` for both.
+      // :6563 emit `gl_FragDepth = ...` for both.
       else if (sins.opcode == DxsoOpcode::TexDepth || sins.opcode == DxsoOpcode::TexM3x2Depth)
         oDepth_used = true;
     }
@@ -1331,7 +1337,7 @@ compile_dxso(
         src = result.get();
         if (src->getType() == int4Ty) {
           // Non-normalized integer formats must be presented as floats.
-          // D3D9 spec: UBYTE4 5 → v.x = 5.0, not int bits.
+          // D3D9 spec: UBYTE4 5 -> v.x = 5.0, not int bits.
           // Bone-index path depends on this; bitcast would collapse to 0.
           src = builder.CreateSIToFP(src, float4Ty);
         }
@@ -1799,14 +1805,14 @@ compile_dxso(
         slot = oDepth_slot;
       break;
     case DxsoRegisterType::AttributeOut:
-      // Only SM ≤ 2 routes through the positional COLOR mapping.
+      // Only SM <= 2 routes through the positional COLOR mapping.
       // SM3's `o#` (Output, alias for TexcoordOut numerically) has
       // its own dcl-driven path landing in a follow-up.
       if (sm12_vs_varyings && dst.base.num < 2)
         slot = oD_slot[dst.base.num];
       break;
     case DxsoRegisterType::TexcoordOut:
-      // SM ≤ 2: positional oT# → TEXCOORD<n>. SM3: same numeric file
+      // SM <= 2: positional oT# -> TEXCOORD<n>. SM3: same numeric file
       // (Output=6) but dcl-driven, so route via oN_slot built from
       // the dcl walk above.
       if (sm12_vs_varyings && dst.base.num < 8)
@@ -2418,7 +2424,7 @@ compile_dxso(
       // src/dxso/dxso_compiler.cpp. m4x3 r0.xyzw still writes
       // only three rows; lane 3 of the dst is preserved instead of
       // being stomped to zero. The i-th dot lands at the i-th set
-      // mask lane so a mask like .yzw routes dot0→y, dot1→z, dot2→w.
+      // mask lane so a mask like .yzw routes dot0->y, dot1->z, dot2->w.
       int target_lane[4] = {-1, -1, -1, -1};
       uint8_t trimmed = 0;
       int kept = 0;
@@ -3218,7 +3224,7 @@ compile_dxso(
     case DxsoOpcode::TexM3x3Spec:
     case DxsoOpcode::TexM3x3VSpec: {
       // SM 1.x reflection cube-map sample. DXVK dxso_compiler.cpp:
-      // 2755-2786. Computes a 3×3 matrix from the prior 2 + current
+      // 2755-2786. Computes a 3x3 matrix from the prior 2 + current
       // texcoord input registers, dots src[0] (tangent) against each
       // row to get the surface normal, builds an eye ray (from src[1]
       // for Spec, from .w of the same 3 texcoord inputs for VSpec),
@@ -3243,7 +3249,7 @@ compile_dxso(
       int xyz[3] = {0, 1, 2};
       auto *float3Ty = FixedVectorType::get(Type::getFloatTy(context), 3);
       Value *n = builder.CreateShuffleVector(n4, n4, ArrayRef<int>(xyz, 3));
-      // Dot each row of the texcoord matrix against src[0] → surface normal.
+      // Dot each row of the texcoord matrix against src[0] -> surface normal.
       Value *normal = UndefValue::get(float3Ty);
       for (uint32_t i = 0; i < count; ++i) {
         uint32_t row_slot = slot - (count - 1) + i;
@@ -3337,8 +3343,8 @@ compile_dxso(
       // SM 1.x dependent texture read: sample 2D texture at sampler
       // <dst.num> using two channels of src[0] as the UV coordinate,
       // and write the resulting texel to t<dst.num>. TexReg2Ar uses
-      // .wx (alpha → u, red → v); TexReg2Gb uses .yz (green → u,
-      // blue → v). wined3d glsl_shader.c shader_glsl_texreg2ar:6792 /
+      // .wx (alpha -> u, red -> v); TexReg2Gb uses .yz (green -> u,
+      // blue -> v). wined3d glsl_shader.c shader_glsl_texreg2ar:6792 /
       // shader_glsl_texreg2gb:6812.
       if (is_vertex || !ins.has_dst || ins.src_count < 1)
         break;
@@ -4012,7 +4018,7 @@ compile_dxso(
         pass = ConstantInt::getFalse(context);
         break;
       }
-      // pass=true → continue; pass=false → discard.
+      // pass=true -> continue; pass=false -> discard.
       builder.CreateCondBr(pass, cont_bb, kill_bb);
     }
     builder.SetInsertPoint(kill_bb);

@@ -27,14 +27,11 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace dxmt {
@@ -116,7 +113,7 @@ class MTLD3D9Interface;
 
 // D3D9StateBlockChanges (the per-category + per-render-state change-tracking
 // mask each MTLD3D9StateBlock owns) lives in d3d9_state_block_changes.hpp,
-// included above, so the host unit tier can pin its PIXELSTATE / VERTEXSTATE /
+// included above, keeping its PIXELSTATE / VERTEXSTATE /
 // ALL membership tables without the device include surface. The device's
 // recording arms mark bits on the in-progress block's instance directly.
 
@@ -174,7 +171,8 @@ public:
   // than from the perf thread-local: an entry point can run on any app thread,
   // and the thread-local only tracks the one that crossed the last present
   // boundary, so off-thread work would go uncounted.
-  dxmt::FrameStatistics *frameStats() const {
+  dxmt::FrameStatistics *
+  frameStats() const {
     return dxmt::perf::enabled() ? &dxmtQueue().CurrentFrameStatistics() : nullptr;
   }
   // Charge the presenting thread's CPU and the fault counters since the
@@ -252,7 +250,7 @@ public:
   // at tail feeds recycling.
   void emitCmdbufTailSignal();
   // Force-commit the current chunk so its cmdbuf actually reaches the
-  // GPU. Used by Lock(DISCARD) when the rename ring runs dry; we
+  // GPU. Used by the draw queue when minted rename bytes cross the threshold; we
   // need the most recently retired backing's signal_seq to be a
   // signal the GPU will eventually retire, not a chunk still buffered
   // on the encode thread. Drains queued draws, drains the legacy sync
@@ -498,6 +496,12 @@ public:
   HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND hDestinationWindow) override;
 
   bool fullscreenOwnsDisplay();
+  // The single occlusion answer for a swapchain window. CheckDeviceState and
+  // the Present-side no-display branch both route through it: wine keeps one
+  // device_state and answers both callers from it (d3d9 device.c), so an app
+  // that polls one while presenting through the other cannot be told two
+  // different stories about the same instant.
+  HRESULT occlusionStatus(HWND hWindow);
   // Drives the non-Ex fullscreen focus-loss transitions from the poll
   // points; see the definition for the wined3d WM_ACTIVATEAPP model.
   void updateNonExLostState();
@@ -507,7 +511,10 @@ public:
   // display mode is already restored and the device window already minimized.
   // Emitting them the other way round inverts the order the tests assert.
   void onFocusActivation(bool activated);
-  bool focusMessagesFiltered() const { return m_focusMessagesFiltered; }
+  bool
+  focusMessagesFiltered() const {
+    return m_focusMessagesFiltered;
+  }
   HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(
       UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality,
       BOOL Lockable, IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle, DWORD Usage
@@ -559,8 +566,9 @@ public:
   canOnlySWVP() const {
     return (m_creationParams.BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) != 0;
   }
-  // A lost device ignores D3DLOCK_DISCARD on a Lock (native drivers keep the
-  // buffer contents; the wine d3d9 tests assert it, DXVK strips it the same way).
+  // A lost device keeps a buffer's contents across a Lock(DISCARD), which the
+  // wine d3d9 tests assert. Nothing has to enforce that here: the mirror holds
+  // the contents and DISCARD does not touch it.
   bool
   isDeviceLost() const {
     return m_deviceState.load(std::memory_order_relaxed) == DeviceState::Lost;
@@ -608,10 +616,9 @@ public:
   struct D3D9DrawCapture;
   // D9EncodingRefs is the per-draw reference-counted state container:
   // shaders, vertex decl, render targets, depth stencil, textures,
-  // vertex buffers, index buffer. Each non-null Com<,false> slot pins
-  // one private ref on the resource it points at; BatchedDraw carries
-  // a std::shared_ptr<D9EncodingRefs> so the resources survive until
-  // every BatchedDraw that referenced them is destroyed.
+  // vertex buffers, index buffer. Each non-null Com<,false> slot pins one
+  // private ref on the resource it points at. There is one mirror, mutated by
+  // the chunk walker in arrival order rather than copied per draw.
   struct D9EncodingRefs {
     Com<class MTLD3D9VertexShader, false> vertex_shader;
     Com<class MTLD3D9PixelShader, false> pixel_shader;
@@ -639,7 +646,7 @@ public:
     // PSO + render-pass identity. POD state (render_states, samplers,
     // streams, constants) on D9EncodingState; ref-counted (textures, VBs)
     // on D9EncodingRefs. Per-draw rename-cursor freeze: gpu_address() /
-    // currentOffset() snapshot at queue time (advance on Lock(DISCARD)).
+    // currentOffset() snapshot at queue time.
     struct VBSlot {
       obj_handle_t buffer = 0;
       uint64_t gpu_address = 0;
@@ -649,7 +656,7 @@ public:
       // frozen from the same immediateName() read that produced buffer /
       // gpu_address above. The emit registers the Vertex-stage read against
       // it, so binding and fence-tracking stay on one allocation even after
-      // a later Lock(DISCARD) renames the buffer. Both map modes populate
+      // a later refresh renames the buffer. Both stream kinds populate
       // it now (BUFFER orders the upload copy, DIRECT fences the in-place
       // backing); null only for unbound streams.
       Rc<dxmt::BufferAllocation> alloc;
@@ -664,7 +671,7 @@ public:
     uint64_t ib_offset = 0;
     D3DFORMAT ib_format = D3DFMT_UNKNOWN;
     // The frozen index-buffer allocation, mirroring VBSlot::alloc; both
-    // map modes populate it, null only for an unbound index buffer.
+    // stream kinds populate it, null only for an unbound index buffer.
     Rc<dxmt::BufferAllocation> ib_alloc;
   };
 
@@ -672,35 +679,17 @@ public:
   // replace bound streams when non-zero. MTLBuffer lifetime pinned by
   // m_constRing signal_seq + setBuffer retain; no per-draw Reference
   // needed.
-  struct BatchedDraw {
-    D3D9DrawCapture cap;
-    // Per-draw POD snapshot captured at queue time for Resolve to read
-    // frozen state without racing setters. COW via m_encShadowDirty:
-    // consecutive draws share one snapshot, O(state-change clusters).
-    // Points into the queue's command-data ring; valid until the owning
-    // chunk retires, which outlives every Resolve read of it.
-    const dxmt::D9EncodingState *pod_snapshot = nullptr;
-    // Ref-counted state is not per-draw; the chunk walker
-    // mutates the persistent device-side D9EncodingRefs mirror
-    // (MTLD3D9Device::m_encodeSideRefs) by replaying the SetRef ops in
-    // arrival order. Resolve reads from that mirror; arrival-order on
-    // the op stream guarantees correctness without a per-draw snapshot.
-    // The 40-Com<>-slot AddRefPrivate / heap-alloc cost the COW model
-    // paid per cluster boundary is gone; wined3d CS / d3d11 EmitOP shape.
-    enum Type : uint8_t { kNonIndexed, kIndexed } type;
-    UINT vertex_or_index_count = 0;
-    UINT start_vertex_or_index = 0;
-    INT base_vertex = 0;
-    D3DPRIMITIVETYPE primitive_type = D3DPT_TRIANGLELIST;
-    // DrawPrimitiveUP / DrawIndexedPrimitiveUP transient-buffer
-    // overrides. Zero/null when the draw uses bound streams.
-    obj_handle_t override_vb_buffer = 0;
-    uint64_t override_vb_addr = 0;
-    uint32_t override_vb_length = 0;
-    uint32_t override_vb_stride = 0;
-    obj_handle_t override_ib_buffer = 0;
-    uint64_t override_ib_offset = 0;
-    D3DFORMAT override_ib_format = D3DFMT_UNKNOWN;
+  // The resolved half of a draw: everything ResolveBatchedDrawForChunk works
+  // out on the encode thread. It lives here rather than on BatchedDraw because
+  // it is consumed within the walker iteration that produces it, so ONE of
+  // these is reused for every draw in a chunk instead of ~1.3 KB being
+  // zero-filled and moved per draw on the calling thread. Every reference keeps
+  // its resolved state consumer-side for the same reason.
+  //
+  // Nothing here may be read after its own iteration. The one value that IS
+  // needed across iterations, the attachment set that decides a render-pass
+  // break, is copied into D9PassAttachments below.
+  struct D9ResolvedDraw {
     // ---- Resolved fields filled by ResolveBatchedDrawForChunk ----
     // Encode-thread work: PSO build, IA layout, view derivation,
     // sampler/DSSO cache. Caches encode-thread-only. resolved_pso_task
@@ -784,11 +773,10 @@ public:
     // for the per-format table (ports DXVK's d3d9_util.h shape).
     // Default 1.0 = no-op for the no-DS-bound case.
     float resolved_depth_bias_scale = 1.0f;
-    // Indexed-draw IB handle + base offset resolved on the calling
-    // thread so the lambda doesn't dereference cap.ib_ref / its mutable
-    // rename cursor. For UP-indexed draws this is the override buffer
-    // and offset; for bound IBs this is metalBuffer().handle and
-    // currentOffset() snapped at resolve time.
+    // Indexed-draw IB handle and base offset, both snapped on the calling
+    // thread in BuildDrawCapture so the chunk lambda never reads a buffer whose
+    // current allocation may have moved. For UP-indexed draws this is the
+    // override buffer and its offset.
     obj_handle_t resolved_ib_handle = 0;
     uint64_t resolved_ib_base_offset = 0;
     // Lifetime pins on VB / IB wrappers. setVertexBuffer doesn't retain
@@ -797,15 +785,14 @@ public:
     // pins; VB/IB need explicit pins. Migration: 17 slots per-draw, 23 on device.
     Com<class MTLD3D9VertexBuffer, false> resolved_vb_pins[D3D9_MAX_VERTEX_STREAMS];
     Com<class MTLD3D9IndexBuffer, false> resolved_ib_pin;
-    // BUFFER-mode streams only: the tracked Private allocation to register
-    // a Vertex-stage read access against so the fence tracker orders the
-    // staged upload copy ahead of this draw. Copied from cap.vb_slots[].alloc
-    // (frozen on the calling thread at BuildDrawCapture), NOT re-read from
-    // immediateName() here, so the read tracks the same allocation the
-    // binding was frozen against even after a later Lock(DISCARD) renames
-    // the buffer. Null for DIRECT-mode and override (UP) streams, which bind by
-    // raw handle and need no read tracking. The wrapper pins above keep the
-    // wrapper alive; the Rc keeps the allocation alive through GPU read.
+    // The tracked allocation to register a Vertex-stage read access against.
+    // Copied from cap.vb_slots[].alloc (frozen on the calling thread at
+    // BuildDrawCapture), NOT re-read from immediateName() here, so the read
+    // tracks the same allocation the binding was frozen against even after a
+    // later refresh renames the buffer. Null for override (UP) streams,
+    // which bind by raw handle and need no read tracking. The wrapper pins
+    // above keep the wrapper alive; the Rc keeps the allocation alive through
+    // GPU read.
     Rc<dxmt::BufferAllocation> resolved_vb_dxmt[D3D9_MAX_VERTEX_STREAMS];
     Rc<dxmt::BufferAllocation> resolved_ib_dxmt;
     // VS/PS f/i/b register-file + clip-plane constant uploads. Resolve
@@ -836,6 +823,61 @@ public:
     // wmt_*_from_d3d9 helpers in every per-draw emit pass.
     WMTViewport resolved_viewport = {};
     WMTScissorRect resolved_scissor = {};
+  };
+
+  // The attachment identity of the draw just resolved, carried to the next
+  // iteration so a render-pass break can be decided without keeping the whole
+  // resolved record alive. Copied, not referenced: the resolved record is
+  // reused and would otherwise be compared against itself.
+  struct D9PassAttachments {
+    // Field names match D9ResolvedDraw so the comparison reads the same on both
+    // sides. This must carry EVERY value the pass test compares, including the
+    // view keys: sRGB aliasing selects a different view for the same handle,
+    // level and slice, and a pass cannot span two of them.
+    obj_handle_t resolved_rt_handles[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    obj_handle_t resolved_ds_handle = 0;
+    uint64_t resolved_rt_view[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    uint64_t resolved_ds_view = 0;
+    uint16_t resolved_rt_level[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    uint16_t resolved_rt_slice[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    uint16_t resolved_ds_level = 0;
+    uint16_t resolved_ds_slice = 0;
+    uint8_t resolved_rt_count = 0;
+    bool resolved_ds_readonly = false;
+    bool valid = false;
+  };
+
+  struct BatchedDraw {
+    D3D9DrawCapture cap;
+    // Per-draw POD snapshot captured at queue time for Resolve to read
+    // frozen state without racing setters. Copy-on-write against
+    // m_encShadowDirty, per axis rather than per snapshot: draws that change
+    // nothing share the whole snapshot, and a draw that does rebuild still
+    // shares the blocks of every axis it left alone. Points into the queue's
+    // command-data ring; valid until the owning chunk retires, which outlives
+    // every Resolve read of it.
+    const dxmt::D9EncodingState *pod_snapshot = nullptr;
+    // Ref-counted state is not per-draw; the chunk walker
+    // mutates the persistent device-side D9EncodingRefs mirror
+    // (MTLD3D9Device::m_encodeSideRefs) by replaying the SetRef ops in
+    // arrival order. Resolve reads from that mirror; arrival-order on
+    // the op stream guarantees correctness without a per-draw snapshot.
+    // The 40-Com<>-slot AddRefPrivate / heap-alloc cost the COW model
+    // paid per cluster boundary is gone; wined3d CS / d3d11 EmitOP shape.
+    enum Type : uint8_t { kNonIndexed, kIndexed } type;
+    UINT vertex_or_index_count = 0;
+    UINT start_vertex_or_index = 0;
+    INT base_vertex = 0;
+    D3DPRIMITIVETYPE primitive_type = D3DPT_TRIANGLELIST;
+    // DrawPrimitiveUP / DrawIndexedPrimitiveUP transient-buffer
+    // overrides. Zero/null when the draw uses bound streams.
+    obj_handle_t override_vb_buffer = 0;
+    uint64_t override_vb_addr = 0;
+    uint32_t override_vb_length = 0;
+    uint32_t override_vb_stride = 0;
+    obj_handle_t override_ib_buffer = 0;
+    uint64_t override_ib_offset = 0;
+    D3DFORMAT override_ib_format = D3DFMT_UNKNOWN;
     // Pending-clear does not ride on the BatchedDraw; it's emitted as
     // a standalone Clear chunk by flushOpenWork's drainPendingClear and
     // folded into the first surviving Render encoder by the dxmt_context
@@ -864,12 +906,11 @@ public:
     // Stretch / format-convert path: render-pass sample/store vs copy.
     // Copy is same-extent bit copy ignoring filter (Metal semantics);
     // Stretch viewport spans dst sub-rect (differs from src under scaling).
-    // BufferCopy stages a locked BUFFER-mode buffer's dirty range from an
-    // upload-ring block into its Private buffer; its access<Compute> write
-    // is what the draw's read access synchronises against. BufferToTexture is
-    // the texture analogue: a mirror-backed level's dirty bytes staged from an
-    // upload-ring block into the Private texture, riding the same arrival-order
-    // stream so a draw queued before the Lock samples the pre-upload contents.
+    // BufferToTexture stages a mirror-backed level's dirty bytes from an
+    // upload-ring block into the Private texture; its access<Compute> write is
+    // what a sampling draw's read access synchronises against, and it rides the
+    // same arrival-order stream so a draw queued before the Lock samples the
+    // pre-upload contents.
     // GenerateMipmaps rides the op stream (dst_tex = the texture) so the AUTOGEN
     // mip-gen is ordered AFTER the level-0 upload/StretchRect that feeds it
     // (those are op-stream writes too now); emitting it directly at flush would
@@ -879,10 +920,9 @@ public:
       Copy = 0,
       Stretch = 1,
       Resolve = 2,
-      BufferCopy = 3,
-      BufferToTexture = 4,
-      GenerateMipmaps = 5,
-      DepthResolve = 6
+      BufferToTexture = 3,
+      GenerateMipmaps = 4,
+      DepthResolve = 5
     };
     Kind kind = Kind::Copy;
     WMTSize dst_size = {};
@@ -897,24 +937,13 @@ public:
     WMTTextureSwizzleChannels src_swizzle = {
         WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha
     };
-    // BufferCopy fields. buf_dst_alloc is the tracked destination
-    // allocation, frozen from the DynamicBuffer's immediateName() when
-    // flushDirty recorded the copy (calling thread) rather than re-read at
-    // emit: a later Lock(DISCARD) renames the buffer, and the draw that
-    // reads this upload froze the same allocation, so the write must land
-    // on it too. Its write is registered via access<Compute> so the fence
-    // tracker orders the copy against draws reading the allocation;
-    // buf_src_handle / buf_src_offset name the upload-ring source block.
-    Rc<dxmt::BufferAllocation> buf_dst_alloc;
-    obj_handle_t buf_src_handle = 0;
-    uint64_t buf_src_offset = 0;
-    uint64_t buf_dst_offset = 0;
-    uint64_t buf_length = 0;
     // BufferToTexture fields. The destination texture level is dst_tex /
     // dst_mip / dst_slice / dst_origin / size (shared with the texture blit
-    // kinds); tex_src_pitch is the source bytes-per-row and tex_bytes_per_image
-    // the per-slice stride of the staged upload-ring block (buf_src_handle /
-    // buf_src_offset).
+    // kinds); buf_src_handle / buf_src_offset name the upload-ring source
+    // block, and tex_src_pitch is the source bytes-per-row with
+    // tex_bytes_per_image the per-slice stride within it.
+    obj_handle_t buf_src_handle = 0;
+    uint64_t buf_src_offset = 0;
     uint32_t tex_src_pitch = 0;
     uint32_t tex_bytes_per_image = 0;
   };
@@ -1009,7 +1038,7 @@ public:
 
 private:
   // BuildDrawCapture freezes per-draw rename cursors (gpu_address/
-  // currentOffset advance on Lock(DISCARD), snapshot at queue time).
+  // currentOffset snapshot at queue time).
   // Ref-counted state travels via setters to D9EncodingState on encode thread;
   // override_* args are per-call, not device state.
   D3D9DrawCapture BuildDrawCapture();
@@ -1094,6 +1123,17 @@ private:
   std::vector<BatchedDraw> m_pendingDraws;
   std::vector<PendingBlitOp> m_pendingBlits;
   std::vector<PendingRefOp> m_pendingRefOps;
+  // High-water of each queue, so the capacity restored after a flush is the
+  // largest batch seen rather than the last one. Batches are flushed per
+  // render-target pass, so their sizes alternate between a handful of draws and
+  // several hundred; restoring the last size makes every large batch after a
+  // small one grow geometrically from almost nothing, and a BatchedDraw is large
+  // enough that the moves dominate the append. Bounded by the largest batch the
+  // title ever submits, which is the memory it was always going to need.
+  size_t m_pendingOpsPeak = 0;
+  size_t m_pendingDrawsPeak = 0;
+  size_t m_pendingBlitsPeak = 0;
+  size_t m_pendingRefOpsPeak = 0;
 
   // Encode-thread-only mirror of ref-counted state. Mutated by walker
   // on SetRef ops in arrival order (wined3d CS / d3d11 shape). SoR for
@@ -1129,7 +1169,7 @@ private:
     uint32_t ffp_texcoord_width_key = 0;
     bool ds_bound = false;
     bool pos_transformed = false;
-    std::array<BatchedDraw::ResolvedConstUpload, 10> uploads = {};
+    std::array<D9ResolvedDraw::ResolvedConstUpload, 10> uploads = {};
   };
   // Cluster cache for the cluster-stable resolved bundle (PSO, DSSO,
   // sampler+texture views, RT/DS resolve, viewport/scissor, IA layout
@@ -1200,8 +1240,8 @@ private:
     // rebind on the same shader/RT).
     uint64_t last_pso_key = 0;
     D3D9PsoCompileTask *last_pso_task = nullptr;
-    // Vbuf-table cache: ~80% cluster hit rate, byte-identical tables
-    // across clusters without SetStreamSource. Cache inputs + (buffer, offset),
+    // Vbuf-table cache: byte-identical tables across clusters without
+    // SetStreamSource. Cache inputs + (buffer, offset),
     // reuse when matched; skips allocate mutex, bump, and per-slot writes.
     uint32_t last_vbuf_slot_mask = 0xFFFFFFFFu;
     uint64_t last_vbuf_base_addr[D3D9_MAX_VERTEX_STREAMS] = {};
@@ -1211,8 +1251,52 @@ private:
     uint64_t last_vbuf_table_offset = 0;
   };
   bool ResolveBatchedDrawForChunk(
-      BatchedDraw &bd, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
+      BatchedDraw &bd, D9ResolvedDraw &res, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
       ResolveCache &resolve_cache
+  );
+
+  // Resolve the cluster-stable half of a draw: the IA layout, the vertex and
+  // pixel variant keys, the PSO, the DSSO, the per-stage textures and
+  // samplers, and the render-target / depth-stencil bundle. Split out of
+  // ResolveBatchedDrawForChunk as the arm the cluster cache exists to skip: it
+  // runs on a miss, fills bd, then records the same fields into resolve_cache
+  // for the draws behind it. The caller owns the gates it reads; a draw with
+  // no declaration or no colour target never reaches here, and the
+  // fixed-function stage selection is already made. The declaration-derived
+  // texcoord widths go back through ffp_texcoord_width, which both the cluster
+  // cache and the constant packer key on. Returns false when the draw cannot
+  // be resolved.
+  bool ResolveClusterState(
+      BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
+      uint32_t *ffp_texcoord_width
+  );
+
+  // What the draw's shader pair looks like to the constant packer: which
+  // stages the fixed-function generator supplies, and which read constants
+  // relatively (c[a0.x + n]), since a relative read decides both the upload
+  // extent and whether the shader's def'd constants have to be stamped in.
+  // Grouped because every field is derived from the same two shaders and the
+  // packer needs all of them together.
+  struct DrawShaderShape {
+    class MTLD3D9VertexShader *vs = nullptr;
+    class MTLD3D9PixelShader *ps = nullptr;
+    bool ffp_vs = false;
+    bool ffp_ps = false;
+    bool vs_uses_relative = false;
+    bool ps_uses_relative = false;
+    bool vs_needs_defs = false;
+    bool ps_needs_defs = false;
+  };
+
+  // Pack this draw's constant buffers into one m_constRingResolve block.
+  // Split out of ResolveBatchedDrawForChunk as its tail phase: it reads the
+  // shader shape the binding resolve derived, but produces nothing that resolve
+  // consumes, so it reaches the rest of the draw only through bd. Returns false
+  // when the ring cannot back the block, which fails the draw.
+  bool PackDrawConstants(
+      BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
+      uint32_t ffp_texcoord_width_key, bool ds_bound, const void *vs_defs_key, const void *ps_defs_key,
+      uint64_t chunk_seq, uint64_t chunk_coherent_id
   );
 
   // Refresh m_cachedSignaled from m_completionEvent and trim retired
@@ -1229,11 +1313,10 @@ private:
   // alternative; public accessors per category; would pollute the
   // device's external surface for an internal concern.
   friend class MTLD3D9StateBlock;
-  // A DIRECT-mode dynamic VB / IB reads m_currentCmdSeq / m_cachedSignaled
-  // for its DynamicBuffer DISCARD recycle, and a plain in-place Lock may
-  // call m_completionEvent.waitUntilSignaledValue to stall the calling
-  // thread until the current allocation's last GPU read has retired (the
-  // write-after-read gate). See MTLD3D9VertexBuffer::Lock.
+  // The buffer classes read m_currentCmdSeq / m_cachedSignaled when a refresh
+  // recycles an allocation from the FIFO, and reach reserveBufferUpload and the
+  // frame counters. A Lock never waits on the GPU: it hands back the host
+  // mirror. See MTLD3D9VertexBuffer::refreshWholeMirror.
   friend class MTLD3D9VertexBuffer;
   friend class MTLD3D9IndexBuffer;
 
@@ -1287,9 +1370,10 @@ private:
   // keep whatever cursor is current.
   HCURSOR m_hwCursor = nullptr;
 #endif
-  // D3D9 device-state machine: Ok -> S_OK, Lost -> D3DERR_DEVICELOST
-  // (unreachable today), NotReset -> D3DERR_DEVICENOTRESET. Ex devices
-  // return S_OK; use CheckDeviceState instead.
+  // D3D9 device-state machine: Ok -> S_OK, Lost -> D3DERR_DEVICELOST,
+  // NotReset -> D3DERR_DEVICENOTRESET. A non-Ex device enters Lost on
+  // fullscreen focus loss. Ex devices always report S_OK from TestCooperative
+  // Level; CheckDeviceState carries their answer instead.
   enum class DeviceState : uint8_t { Ok, Lost, NotReset };
   std::atomic<DeviceState> m_deviceState{DeviceState::Ok};
   // Live count of app-created D3DPOOL_DEFAULT resources. Bumped by
@@ -1330,9 +1414,10 @@ private:
   // re-derived from the restored LOD-bias in d3d9_state_block.cpp Apply (DXVK
   // handles it there too, its Apply routes through SetStateSamplerState).
   uint16_t m_fetch4Latch = 0;
-  // Generated fixed-function shader cache: vertex functions keyed by
-  // the IA-layout fingerprint (plus the has-diffuse bit), one pixel
-  // function until the stage-combiner milestones add axes. The value is
+  // Generated fixed-function shader cache: vertex functions keyed by the
+  // IA-layout fingerprint plus the has-diffuse bit, pixel functions by the
+  // per-stage combiner table and the render states that change the generated
+  // code rather than a uniform. The value is
   // the async compile task; a task whose function() latches null caches a
   // compile failure the same way the variant caches do. One of the
   // task-owning containers m_psoScheduler must outlive at teardown (see its
@@ -1373,8 +1458,7 @@ private:
   );
   D3D9CompiledFunction *ffpPixelFunction(
       const uint32_t (*stages)[3], bool specular_enable, bool point_sprite, int fog_mode, bool fog_coord_w,
-      uint32_t alpha_func, uint32_t sampler_kind_key, bool flat_shading, bool emit_sample_mask,
-      uint32_t unorm_snap_mask
+      uint32_t alpha_func, uint32_t sampler_kind_key, bool flat_shading, bool emit_sample_mask, uint32_t unorm_snap_mask
   );
   // Set at destructor entry; flips releaseBufferBacking to direct-free so
   // late donors (members destructing after the pool) never touch it.
@@ -1631,8 +1715,8 @@ private:
   // SetStreamSourceFreq / GetStreamSourceFreq packed setting per
   // stream. Default 1 = "advance once per vertex, draw 1 instance".
   // Encoding follows the D3D9 spec (matches DXVK m_state.streamFreq):
-  //   Stream 0 ⇒  D3DSTREAMSOURCE_INDEXEDDATA | InstanceCount
-  //   Stream N ⇒  D3DSTREAMSOURCE_INSTANCEDATA | DivisorOrZero
+  //   Stream 0 holds D3DSTREAMSOURCE_INDEXEDDATA | InstanceCount
+  //   Stream N holds D3DSTREAMSOURCE_INSTANCEDATA | DivisorOrZero
   // The draw path inspects bit 30 (INDEXEDDATA) on stream 0 to pull
   // instance_count out of the low 23 bits, and bit 31 (INSTANCEDATA)
   // on streams 1..15 to mark the IA element as per-instance.
@@ -1743,6 +1827,15 @@ private:
   float m_ffpNormal[3][4] = {};
   bool m_ffpFogCoordW = false;
   bool m_ffpWVPStale = true;
+  // The first eight enabled lights, already transformed into view space, in the
+  // layout the snapshot wants. Rebuilt when a light, an enable flag, or the view
+  // transform changes, rather than per draw: the FFP axis is one block, so
+  // without this a SetMaterial re-transforms every light for a change that
+  // touched none of them. wined3d keeps lighting on its own dirty section for
+  // the same reason.
+  float m_ffpLightsView[8][28] = {};
+  uint32_t m_ffpLightsViewCount = 0;
+  bool m_ffpLightsViewStale = true;
 
   // FFP material, default-constructed all-zero: wined3d
   // (stateblock_state_init_default leaves it zero), DXVK and d9vk all default
@@ -1952,7 +2045,8 @@ public:
   // marked mips-dirty (flagContainerAutoGenDirty / UpdateTexture) and when a
   // dirty texture is bound, so the next QueueBatchedDraw sees the epoch move
   // and regenerates before the draws that sample the chain.
-  void markAutogenMipsDirty() {
+  void
+  markAutogenMipsDirty() {
     m_autogenDirtyEpoch.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -1960,7 +2054,8 @@ public:
   // with pending upload levels is bound (SetTexture / StateBlock Apply) and from
   // EvictManagedResources, so the next QueueBatchedDraw re-pushes those levels
   // from the sysmem mirror before the draws that sample them.
-  void markManagedUploadPending() {
+  void
+  markManagedUploadPending() {
     m_managedUploadEpoch.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -1997,25 +2092,21 @@ public:
       WMTSize size, const void *src, uint32_t src_pitch, bool is_compressed, uint32_t src_slice_pitch = 0
   );
 
-  // Stage a BUFFER-mode buffer's dirty range into its Private allocation.
-  // Copies src into an m_uploadRing block on the calling thread, then
-  // queues a BufferCopy blit op (arrival-order, so it interleaves with
-  // draws). The op's access<Compute> write against dst is what orders the
-  // copy against draws that register a read on the same allocation; see
-  // MTLD3D9VertexBuffer::flushDirty and the op-stream walker.
   // A ring block that has been checked before anything writes through it. A
   // ring hands back a block it could not back rather than reporting the
   // failure, and a 32-bit address space reaches that under pressure, so every
   // consumer goes through tryRingAllocate instead of dereferencing the block a
-  // ring returns. Mirrors what discardRenameDynamicBuffer already does for a
-  // renamed allocation.
+  // ring returns. The buffer refresh checks its renamed allocation the same way.
   struct RingBlockSpan {
     void *host = nullptr;
     obj_handle_t handle = 0;
     uint64_t offset = 0;
     uint64_t gpu_address = 0;
 
-    explicit operator bool() const { return host != nullptr; }
+    explicit
+    operator bool() const {
+      return host != nullptr;
+    }
   };
 
   // Retries once against the GPU's true progress before giving up. A ring only
@@ -2067,28 +2158,6 @@ public:
     return span;
   }
 
-  // Space secured in the staging ring, taken before the destination buffer is
-  // renamed. A rename installs an allocation holding no valid contents, so the
-  // ring space has to be in hand first: a reservation that fails then leaves the
-  // previous generation bound and the source dirty, and the draw reads
-  // one-refresh-stale geometry instead of whatever the recycled block last held.
-  struct StagingReservation {
-    void *host = nullptr;
-    obj_handle_t src_handle = 0;
-    uint64_t offset = 0;
-
-    explicit operator bool() const { return host != nullptr; }
-  };
-
-  // Fails when the ring has no backing left, which a 32-bit address space
-  // reaches under pressure.
-  StagingReservation reserveBufferUpload(uint64_t length);
-
-  void commitBufferUpload(
-      const StagingReservation &reservation, const Rc<dxmt::BufferAllocation> &dst_alloc, uint64_t dst_offset,
-      const void *src, uint64_t length
-  );
-
   // Synchronous GPU -> host-mirror readback for a lockable render
   // target's LockRect: drain queued draws, blit the surface's texture
   // into an m_uploadRing block, wait for retirement, memcpy into the
@@ -2124,9 +2193,8 @@ public:
   // everything else encodes through ClearRenderTargetContext's
   // scissored quad like d3d11 ClearView. Mirrors DXVK
   // d3d9_device.cpp's ClearImageView full-vs-partial split.
-  void emitClippedClear(
-      const std::vector<WMTScissorRect> &regions, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil
-  );
+  void
+  emitClippedClear(const std::vector<WMTScissorRect> &regions, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil);
 };
 
 } // namespace dxmt

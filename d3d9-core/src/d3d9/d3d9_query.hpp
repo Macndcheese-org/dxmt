@@ -49,13 +49,13 @@ private:
   // the d3d9 wrapper turns wined3d's INVALIDCALL into a poisoned-buffer S_OK)
   // from one mid-window (BUILDING: S_FALSE).
   bool m_began = false;
-  // Tracks whether D3DISSUE_END has run (QUERY_SIGNALLED). Before any END the
-  // CREATED / BUILDING paths above apply. wined3d query.c enforces the order.
+  // Whether D3DISSUE_END has run (QUERY_SIGNALLED). wined3d query.c enforces
+  // the CREATED -> BUILDING -> SIGNALLED order.
   bool m_ended = false;
   // EVENT-query GPU completion seq. Captured at Issue(D3DISSUE_END):
   // the queue's CurrentSeqId: the chunk-in-flight that all-prior work
   // up to the END landed in. GetData polls CoherentSeqId against this
-  // value; when GPU-coherent ≥ captured, the event is signaled. Zero
+  // value; when GPU-coherent >= captured, the event is signaled. Zero
   // before any END so the EVENT type defaults to "signaled" if the
   // app polls before issuing; matches the prior stub shape.
   uint64_t m_event_seq = 0;
@@ -74,7 +74,7 @@ private:
   // Null until Begin; read returns 0 in that case.
   Rc<VisibilityResultQuery> m_visibility_query;
   // Self-pin shape mirrors MTLD3D9StateBlock: keep `this` alive
-  // across the public 1→0 transition long enough for the override
+  // across the public 1->0 transition long enough for the override
   // to drop the device pin safely.
   bool m_self_pinned = true;
 };
