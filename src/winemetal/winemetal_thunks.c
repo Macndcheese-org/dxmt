@@ -1232,3 +1232,84 @@ MTLCommandQueue_addResidencySet(obj_handle_t queue, obj_handle_t residency_set) 
   params.arg = residency_set;
   UNIX_CALL(137, &params);
 }
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info) {
+  struct unixcall_mtldevice_newheap params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  UNIX_CALL(138, &params);
+  return params.ret;
+}
+
+WINEMETAL_API struct WMTSizeAndAlign
+MTLDevice_heapBufferSizeAndAlign(obj_handle_t device, uint64_t length, enum WMTResourceOptions options) {
+  struct unixcall_mtldevice_heapbuffersizeandalign params;
+  params.device = device;
+  params.length = length;
+  params.options = options;
+  UNIX_CALL(139, &params);
+  struct WMTSizeAndAlign ret;
+  ret.size = params.ret_size;
+  ret.align = params.ret_align;
+  return ret;
+}
+
+WINEMETAL_API struct WMTSizeAndAlign
+MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, struct WMTTextureInfo *info) {
+  struct unixcall_mtldevice_heaptexturesizeandalign params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  UNIX_CALL(140, &params);
+  struct WMTSizeAndAlign ret;
+  ret.size = params.ret_size;
+  ret.align = params.ret_align;
+  return ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newbuffer params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  UNIX_CALL(141, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newtexture params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  UNIX_CALL(142, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newIndirectCommandBuffer(
+    obj_handle_t device, struct WMTIndirectCommandBufferInfo *info, uint64_t max_count, enum WMTResourceOptions options
+) {
+  struct unixcall_mtldevice_newicb params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.max_count = max_count;
+  params.options = options;
+  UNIX_CALL(143, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newLibraryWithSource(obj_handle_t device, const char *source, uint64_t length, obj_handle_t *err_out) {
+  struct unixcall_mtldevice_newlibrarywithsource params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.source, source);
+  params.length = length;
+  params.ret_error = 0;
+  params.ret_library = 0;
+  UNIX_CALL(144, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_library;
+}

@@ -30,6 +30,8 @@ enum class DirtyState {
   ScissorRect,
   ComputeRootArguments,
   ComputeRootSignature,
+  BlendFactor,
+  StencilRef,
 };
 
 enum class DrawCallStatus {
@@ -145,6 +147,9 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   Com<MTLD3D12RootSignature, false> rootsig_compute_;
   uint64_t rootarg_compute_staging_[64];
 
+  FLOAT blend_factor_[4];
+  UINT8 stencil_ref_;
+
 public:
   MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice) : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice) {}
 
@@ -177,6 +182,12 @@ public:
 
     num_scissors = {};
     memset(scissors, 0, sizeof(scissors));
+
+    blend_factor_[0] = 1.0f;
+    blend_factor_[1] = 1.0f;
+    blend_factor_[2] = 1.0f;
+    blend_factor_[3] = 1.0f;
+    stencil_ref_ = 0;
 
     rootsig_graphics_ = nullptr;
     memset(rootarg_graphics_staging_, 0, sizeof(rootarg_graphics_staging_));
@@ -283,7 +294,7 @@ public:
   }
 
   DrawCallStatus
-  PreDraw() {
+  PreDraw(bool SkipResourceBinding = false) {
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
 
       allocator_->InvalidateCurrentPass();
@@ -355,16 +366,16 @@ public:
       }
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
+      dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
     }
     if (dirty_state_.test(DirtyState::VertexBuffer)) {
       EncodeVertexBuffers();
       dirty_state_.clr(DirtyState::VertexBuffer);
     }
 
-    if (dirty_state_.test(DirtyState::GraphicsRootArguments)) {
+    if (dirty_state_.test(DirtyState::GraphicsRootArguments) && !SkipResourceBinding) {
       if (rootsig_graphics_) {
-        auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * rootsig_graphics_->UploadQwords, 64);
-        memcpy(Ptr, rootarg_graphics_staging_, rootsig_graphics_->UploadQwords * sizeof(uint64_t));
+        auto Offset = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
         auto &cmd_vsargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
         cmd_vsargbuf.type = WMTRenderCommandSetVertexBuffer;
         cmd_vsargbuf.buffer = allocator_->gpu_heap_buffer_;
@@ -379,11 +390,9 @@ public:
       dirty_state_.clr(DirtyState::GraphicsRootArguments);
     }
 
-    if (dirty_state_.test(DirtyState::GraphicsRootSignature)) {
+    if (dirty_state_.test(DirtyState::GraphicsRootSignature) && !SkipResourceBinding) {
       if (rootsig_graphics_) {
-        auto static_sampler_encode_size = sizeof(uint64_t) * rootsig_graphics_->NumStaticSamplers * 4;
-        auto [Ptr, Offset] = allocator_->AllocateGPUHeap(static_sampler_encode_size, 64);
-        memcpy(Ptr, rootsig_graphics_->EncodedStaticSamplers, static_sampler_encode_size);
+        auto Offset = EncodeStaticSamplers(rootsig_graphics_.ptr());
         auto &cmd_vsargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
         cmd_vsargbuf.type = WMTRenderCommandSetVertexBuffer;
         cmd_vsargbuf.buffer = allocator_->gpu_heap_buffer_;
@@ -432,6 +441,24 @@ public:
       cmd.rect_count = num_viewports;
       dirty_state_.clr(DirtyState::ScissorRect);
     }
+
+    if (dirty_state_.test(DirtyState::BlendFactor)) {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setblendcolor>();
+      cmd.type = WMTRenderCommandSetBlendFactor;
+      cmd.red = blend_factor_[0];
+      cmd.green = blend_factor_[1];
+      cmd.blue = blend_factor_[2];
+      cmd.alpha = blend_factor_[3];
+      dirty_state_.clr(DirtyState::BlendFactor);
+    }
+
+    if (dirty_state_.test(DirtyState::StencilRef)) {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setstencilref>();
+      cmd.type = WMTRenderCommandSetStencilRef;
+      cmd.stencil_ref = stencil_ref_;
+      dirty_state_.clr(DirtyState::StencilRef);
+    }
+
     return DrawCallStatus::Ordinary;
   }
 
@@ -478,8 +505,27 @@ public:
     cmd_draw.base_instance = StartInstanceLocation;
   };
 
+  uint64_t
+  EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[64], UINT Count = 1) {
+    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64);
+    for (unsigned i = 0; i < Count; i++)
+      memcpy(
+          reinterpret_cast<uint64_t *>(Ptr) + i * pRootSig->UploadQwords, pStaging,
+          pRootSig->UploadQwords * sizeof(uint64_t)
+      );
+    return Offset;
+  }
+
+  uint64_t
+  EncodeStaticSamplers(MTLD3D12RootSignature *pRootSig) {
+    auto static_sampler_encode_size = sizeof(uint64_t) * pRootSig->NumStaticSamplers * 4;
+    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(static_sampler_encode_size, 64);
+    memcpy(Ptr, pRootSig->EncodedStaticSamplers, static_sampler_encode_size);
+    return Offset;
+  }
+
   bool
-  PreDispatch() {
+  PreDispatch(bool SkipResourceBinding = false) {
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute) {
       allocator_->InvalidateCurrentPass();
       auto compute = allocator_->AllocatePass<ComputeEncoderData>();
@@ -496,10 +542,9 @@ public:
       }
     }
 
-    if (dirty_state_.test(DirtyState::ComputeRootArguments)) {
+    if (dirty_state_.test(DirtyState::ComputeRootArguments) && !SkipResourceBinding) {
       if (rootsig_compute_) {
-        auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * rootsig_compute_->UploadQwords, 64);
-        memcpy(Ptr, rootarg_compute_staging_, rootsig_compute_->UploadQwords * sizeof(uint64_t));
+        auto Offset = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_);
         auto &cmd_argbuf = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         cmd_argbuf.type = WMTComputeCommandSetBuffer;
         cmd_argbuf.buffer = allocator_->gpu_heap_buffer_;
@@ -509,11 +554,9 @@ public:
       dirty_state_.clr(DirtyState::ComputeRootArguments);
     }
 
-    if (dirty_state_.test(DirtyState::ComputeRootSignature)) {
+    if (dirty_state_.test(DirtyState::ComputeRootSignature) && !SkipResourceBinding) {
       if (rootsig_compute_) {
-        auto static_sampler_encode_size = sizeof(uint64_t) * rootsig_compute_->NumStaticSamplers * 4;
-        auto [Ptr, Offset] = allocator_->AllocateGPUHeap(static_sampler_encode_size, 64);
-        memcpy(Ptr, rootsig_compute_->EncodedStaticSamplers, static_sampler_encode_size);
+        auto Offset = EncodeStaticSamplers(rootsig_compute_.ptr());
         auto &cmd_argbuf = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         cmd_argbuf.type = WMTComputeCommandSetBuffer;
         cmd_argbuf.buffer = allocator_->gpu_heap_buffer_;
@@ -649,11 +692,15 @@ public:
         if (!src)
           return;
 
-        auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
-        cmd_cp.type = WMTBlitCommandCopyFromTextureToBuffer;
+        auto src_planar_count = getPlanarCount(src->pixelFormat());
+        auto src_subresource_index = pSrc->SubresourceIndex / src_planar_count;
+        auto src_subresource_planar = pSrc->SubresourceIndex % src_planar_count;
+
+        auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+        cmd_cp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
         cmd_cp.src = src->current()->texture();
-        cmd_cp.level = pSrc->SubresourceIndex % src->miplevelCount();
-        cmd_cp.slice = pSrc->SubresourceIndex / src->miplevelCount();
+        cmd_cp.level = src_subresource_index % src->miplevelCount();
+        cmd_cp.slice = src_subresource_index / src->miplevelCount();
         cmd_cp.origin = {0, 0, 0};
         cmd_cp.size = {
             pDst->PlacedFootprint.Footprint.Width, pDst->PlacedFootprint.Footprint.Height,
@@ -665,6 +712,9 @@ public:
         cmd_cp.bytes_per_image = src->textureType() == WMTTextureType3D
                                      ? pDst->PlacedFootprint.Footprint.Height * pDst->PlacedFootprint.Footprint.RowPitch
                                      : 0;
+        cmd_cp.options = (src_planar_count > 1) ? (src_subresource_planar ? WMTBlitOptionStencilFromDepthStencil
+                                                                          : WMTBlitOptionDepthFromDepthStencil)
+                                                : WMTBlitOptionNone;
       } else {
         // so it is buffer to buffer copy?
         IMPLEMENT_ME
@@ -788,9 +838,24 @@ public:
     dirty_state_.set(DirtyState::ScissorRect);
   };
 
-  void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT BlendFactors[4]) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  OMSetBlendFactor(const FLOAT BlendFactors[4]) {
+    if (BlendFactors) {
+      memcpy(blend_factor_, BlendFactors, std::size(blend_factor_) * sizeof(blend_factor_[0]));
+    } else {
+      blend_factor_[0] = 1.0f;
+      blend_factor_[1] = 1.0f;
+      blend_factor_[2] = 1.0f;
+      blend_factor_[3] = 1.0f;
+    }
+    dirty_state_.set(DirtyState::BlendFactor);
+  };
 
-  void STDMETHODCALLTYPE OMSetStencilRef(UINT StencilRef) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  OMSetStencilRef(UINT StencilRef) {
+    stencil_ref_ = StencilRef;
+    dirty_state_.set(DirtyState::StencilRef);
+  };
 
   void
   UpdateGraphicsPSO(MTLD3D12GraphicsPipelineState *pso_graphics) {
@@ -1255,7 +1320,63 @@ public:
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
       UINT64 ArgBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset
   ) {
-    IMPLEMENT_ME
+    auto sig = static_cast<MTLD3D12CommandSignature *>(pCommandSignature);
+    auto arg_buffer = static_cast<MTLD3D12Resource *>(pArgBuffer);
+    if (!arg_buffer || !arg_buffer->buffer)
+      return;
+    auto ArgBufferAddress = arg_buffer->buffer->current()->gpuAddress() + ArgBufferOffset;
+    uint64_t CountBufferAddress = 0;
+    if (auto count_buffer = static_cast<MTLD3D12Resource *>(pCountBuffer)) {
+      if (!count_buffer->buffer)
+        return;
+      CountBufferAddress = count_buffer->buffer->current()->gpuAddress() + CountBufferOffset;
+    }
+    if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+      if (!PreDispatch(sig->UpdateRootArguments))
+        return;
+
+      auto cmd = allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
+      cmd->max_count_buffer = CountBufferAddress;
+      cmd->argument_buffer = ArgBufferAddress;
+
+      if (sig->UpdateRootArguments) {
+        cmd->rootsig_qwords = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount);
+        cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
+        cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
+        cmd->static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
+        cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+      }
+
+      return;
+    }
+    WMTPrimitiveType primitive_type;
+    uint32_t cp_count;
+    if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
+      return;
+    bool encode_binding = sig->UpdateRootArguments || sig->UpdateIndexBuffer || sig->UpdateVertexBuffers;
+    DrawCallStatus status = PreDraw(encode_binding);
+    if (status == DrawCallStatus::Invalid)
+      return;
+    if (status != DrawCallStatus::Ordinary) {
+      IMPLEMENT_ME // TODO: (potential) emulated pipeline
+    }
+
+    auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), MaxCommandCount);
+    cmd->max_count_buffer = CountBufferAddress;
+    cmd->argument_buffer = ArgBufferAddress;
+    cmd->primitive_type = primitive_type;
+    cmd->index_buffer = index_buffer_address;
+    cmd->index_buffer_format = index_type == WMTIndexTypeUInt32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    if (!encode_binding)
+      return;
+    cmd->rootsig_qwords = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount);
+    cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
+    cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
+    cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
+    cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+    auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount);
+    cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
+    cmd->vertex_argbuf_stride = VBStride;
   };
 };
 
