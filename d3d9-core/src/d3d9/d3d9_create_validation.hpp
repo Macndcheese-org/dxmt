@@ -36,6 +36,18 @@
 
 namespace dxmt {
 
+// Folds the Ex spelling of MANAGED onto MANAGED. False when the pool is not
+// legal for this device, which is pool 6 on a non-Ex device.
+inline bool
+d3d9_fold_managed_ex(D3DPOOL &pool, bool is_ex) {
+  if (pool != D3DPOOL_MANAGED_EX)
+    return true;
+  if (!is_ex)
+    return false;
+  pool = D3DPOOL_MANAGED;
+  return true;
+}
+
 enum class D3D9TextureCreateKind : uint8_t {
   Texture2D,
   Cube,
@@ -89,10 +101,9 @@ validate_texture_create(const D3D9TextureCreateInfo &c) {
   // nothing else here, so the rest of the matrix is unaffected.  Callers fold
   // the same way after this returns, so downstream pool comparisons agree.
   if (c.pool == D3DPOOL_MANAGED_EX) {
-    if (!c.is_ex)
-      return D3DERR_INVALIDCALL;
     D3D9TextureCreateInfo folded = c;
-    folded.pool = D3DPOOL_MANAGED;
+    if (!d3d9_fold_managed_ex(folded.pool, folded.is_ex))
+      return D3DERR_INVALIDCALL;
     folded.is_ex = false;
     return validate_texture_create(folded);
   }
@@ -117,7 +128,7 @@ validate_texture_create(const D3D9TextureCreateInfo &c) {
     return D3DERR_INVALIDCALL;
 
   // Pool enum validity (DEFAULT..SCRATCH). D3DPOOL_MANAGED is invalid on a
-  // D3D9Ex device (the distinct MANAGED_EX value 6 is handled elsewhere).
+  // D3D9Ex device, which spells it MANAGED_EX; that value is folded above.
   if (c.pool > D3DPOOL_SCRATCH)
     return D3DERR_INVALIDCALL;
   if (c.pool == D3DPOOL_MANAGED && c.is_ex)

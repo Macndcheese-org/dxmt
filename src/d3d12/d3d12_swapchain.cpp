@@ -99,6 +99,8 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   bool
   LayerSupportEDR() {
     WMTEDRValue edr_value;
+    if (layer_weak_.handle == 0)
+      return false;
     MetalLayer_getEDRValue(layer_weak_, &edr_value);
     return edr_value.maximum_potential_edr_color_component_value > 1.0f;
   };
@@ -119,14 +121,7 @@ public:
       hud(WMT::DeveloperHUDProperties::instance()),
       lib(pDevice->GetMTLDevice()) {
 
-    native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
-
-    if (!native_view_) {
-      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
-      abort();
-    }
-
-    presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count));
+    // The Metal view is NOT created here: see EnsurePresentTarget().
 
     frame_latency = kSwapchainLatency;
     present_semaphore_ = CreateSemaphore(nullptr, frame_latency, DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
@@ -167,8 +162,36 @@ public:
       backbuffer_desc_.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   }
 
+  /* Resolve the HWND to an NSView / CAMetalLayer and stand up the Presenter,
+   * once, on the first Present rather than in the constructor.
+   *
+   * A swapchain backbuffer is an ordinary render target, so an application may
+   * create a swapchain for a window purely to render into and never present it.
+   * Creating the view in the constructor attached a CAMetalLayer to such a
+   * window regardless, and a CAMetalLayer is opaque, so a chain that never
+   * presents covered its window with the backbuffer's initial contents.
+   * Deferring the attach leaves a render-only chain's window alone; the first
+   * real Present materialises the view exactly as before. */
+  void EnsurePresentTarget() {
+    if (presenter != nullptr)
+      return;
+
+    native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, device_->GetMTLDevice(), layer_weak_);
+
+    if (!native_view_) {
+      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
+      abort();
+    }
+
+    Logger::info(str::format("D3D12: present target hwnd=", reinterpret_cast<uintptr_t>(hWnd),
+                             " size=", desc_.Width, "x", desc_.Height));
+
+    presenter = Rc(new Presenter(device_->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count));
+  }
+
   ~MTLD3D12SwapChain() {
-    WMT::ReleaseMetalView(native_view_);
+    if (native_view_ != nullptr)
+      WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
     CloseHandle(present_semaphore_);
   };
@@ -351,7 +374,7 @@ public:
         desc_.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : colorspace_,
         LayerSupportEDR()
     );
-    if (presenter->changeLayerProperties(
+    if (presenter != nullptr && presenter->changeLayerProperties(
             ConvertSwapChainFormat(desc_.Format), target_color_space, desc_.Width * scale_factor,
             desc_.Height * scale_factor, desc_.SampleDesc.Count
         )) {
@@ -433,6 +456,10 @@ public:
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
+    // First Present is what attaches this window's CAMetalLayer: a chain the
+    // app only ever renders into never reaches here, so it never covers its
+    // window (see EnsurePresentTarget). No-op once the target is up.
+    EnsurePresentTarget();
 
     auto &backbuffer = backbuffers_[presentation_count_ % backbuffers_.size()];
     // TODO(d3d12): flush command queue and present
@@ -564,7 +591,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) override {
     auto target_color_space = ConvertColorSpace(ColorSpace, LayerSupportEDR());
-    if (presenter->changeLayerColorSpace(target_color_space)) {
+    if (presenter != nullptr && presenter->changeLayerColorSpace(target_color_space)) {
       // TODO(d3d12): flush command queue
     }
     colorspace_ = ColorSpace;

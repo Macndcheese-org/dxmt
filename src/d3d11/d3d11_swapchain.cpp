@@ -140,36 +140,11 @@ public:
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
-    HDC hdc = GetDC(hWnd);
-    int escapeCode = MACDRV_ESCAPE_GET_SURFACE;
-    int supported = ExtEscape(hdc, QUERYESCSUPPORT, sizeof(int), (LPCSTR)&escapeCode, 0, NULL);
-    if (supported > 0) {
-      struct macdrv_escape_surface surfaceInfo = {0};
-      int result = ExtEscape(hdc, MACDRV_ESCAPE_GET_SURFACE, 0, NULL, sizeof(surfaceInfo), (LPSTR)&surfaceInfo);
-      if (result > 0 && surfaceInfo.layer) {
-        client_surface_.handle = surfaceInfo.surface;
-        layer_weak_.handle = surfaceInfo.layer;
-      }
-    }
-    ReleaseDC(hWnd, hdc);
-
-    if (!layer_weak_) {
-      ERR("Failed to get metal layer via MACDRV_ESCAPE_GET_SURFACE.");
-      native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
-    }
-
-    if (!layer_weak_) {
-      ERR("Failed to get metal layer, it seems like your Wine has not the needed functionality for DXMT.");
-      abort();
-    }
-
     if constexpr (EnableMetalFX) {
       scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
     }
 
-    presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
-                                 pDevice->GetDXMTDevice().queue().cmd_library,
-                                 scale_factor, desc_.SampleDesc.Count));
+    // The window's Metal layer is NOT acquired here: see EnsurePresentTarget().
 
     frame_latency = kSwapchainLatency;
     present_semaphore_ = CreateSemaphore(nullptr, frame_latency,
@@ -237,13 +212,60 @@ public:
       surfaceInfo.surface = client_surface_.handle;
       ExtEscape(hdc, MACDRV_ESCAPE_RELEASE_SURFACE, sizeof(surfaceInfo), (LPCSTR)&surfaceInfo, 0, NULL);
       ReleaseDC(hWnd, hdc);
-    } else {
+    } else if (native_view_ != nullptr) {
       WMT::ReleaseMetalView(native_view_);
     }
     client_surface_ = {};
     native_view_ = {};
     CloseHandle(present_semaphore_);
   };
+
+  /* Acquire the window's Metal layer and stand up the Presenter, once, on the
+   * first Present rather than in the constructor.
+   *
+   * A swapchain backbuffer is an ordinary render target, so an application may
+   * create a swapchain for a window purely to render into and never present it
+   * -- WPF's MilCore does exactly that for a popup HWND, drawing into that
+   * chain and compositing the result into the parent's chain. Acquiring the
+   * layer in the constructor bound a CAMetalLayer to such a window regardless,
+   * and a CAMetalLayer is opaque, so a chain that never presents covered its
+   * window with the backbuffer's initial contents. Deferring the acquire leaves
+   * a render-only chain's window alone; the first real Present binds it exactly
+   * as before. */
+  void EnsurePresentTarget() {
+    if (presenter != nullptr)
+      return;
+
+    HDC hdc = GetDC(hWnd);
+    int escapeCode = MACDRV_ESCAPE_GET_SURFACE;
+    int supported = ExtEscape(hdc, QUERYESCSUPPORT, sizeof(int), (LPCSTR)&escapeCode, 0, NULL);
+    if (supported > 0) {
+      struct macdrv_escape_surface surfaceInfo = {0};
+      int result = ExtEscape(hdc, MACDRV_ESCAPE_GET_SURFACE, 0, NULL, sizeof(surfaceInfo), (LPSTR)&surfaceInfo);
+      if (result > 0 && surfaceInfo.layer) {
+        client_surface_.handle = surfaceInfo.surface;
+        layer_weak_.handle = surfaceInfo.layer;
+      }
+    }
+    ReleaseDC(hWnd, hdc);
+
+    if (!layer_weak_) {
+      ERR("Failed to get metal layer via MACDRV_ESCAPE_GET_SURFACE.");
+      native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, device_->GetMTLDevice(), layer_weak_);
+    }
+
+    if (!layer_weak_) {
+      ERR("Failed to get metal layer, it seems like your Wine has not the needed functionality for DXMT.");
+      abort();
+    }
+
+    Logger::info(str::format("DXGI: present target hwnd=", reinterpret_cast<uintptr_t>(hWnd),
+                             " size=", desc_.Width, "x", desc_.Height));
+
+    presenter = Rc(new Presenter(device_->GetMTLDevice(), layer_weak_,
+                                 device_->GetDXMTDevice().queue().cmd_library,
+                                 scale_factor, desc_.SampleDesc.Count));
+  }
 
   HRESULT
   STDMETHODCALLTYPE
@@ -397,7 +419,8 @@ public:
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
     
-    presenter->changeGammaRamp(nullptr);
+    if (presenter != nullptr)
+      presenter->changeGammaRamp(nullptr);
 
     return S_OK;
   }
@@ -613,7 +636,7 @@ public:
                               ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                               : colorspace_,
                           LayerSupportEDR());
-    if (presenter->changeLayerProperties(
+    if (presenter != nullptr && presenter->changeLayerProperties(
             ConvertSwapChainFormat(desc_.Format), target_color_space, desc_.Width * scale_factor,
             desc_.Height * scale_factor, desc_.SampleDesc.Count
         ))
@@ -767,6 +790,11 @@ public:
            const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
+
+    // First Present is what binds this window's CAMetalLayer: a chain the app
+    // only ever renders into never reaches here, so it never covers its window
+    // (see EnsurePresentTarget). No-op once the target is up.
+    EnsurePresentTarget();
 
     HRESULT hr = S_OK;
     bool window_minimized = wsi::isMinimized(hWnd);
@@ -1057,7 +1085,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) override {
     auto target_color_space = ConvertColorSpace(ColorSpace, LayerSupportEDR());
-    if (presenter->changeLayerColorSpace(target_color_space))
+    if (presenter != nullptr && presenter->changeLayerColorSpace(target_color_space))
       device_context_->WaitUntilGPUIdle();
     colorspace_ = ColorSpace;
     return S_OK;
