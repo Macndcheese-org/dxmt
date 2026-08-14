@@ -187,6 +187,12 @@ public:
                              " size=", desc_.Width, "x", desc_.Height));
 
     presenter = Rc(new Presenter(device_->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count));
+
+    /* ResizeBuffers() runs before the presenter exists, so the layer properties
+     * it would have applied were skipped. Apply them now that there is a layer
+     * to configure, otherwise it keeps the format and drawable size it was
+     * created with and nothing is ever presented. */
+    ApplyLayerProps();
   }
 
   ~MTLD3D12SwapChain() {
