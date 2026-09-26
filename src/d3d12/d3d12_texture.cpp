@@ -119,6 +119,33 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
   // TODO: decide storage mode
   InfoOut.options = WMTResourceHazardTrackingModeUntracked;
 
+  if (Desc.Alignment) {
+    if (Desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+        Desc.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
+        (Desc.SampleDesc.Count == 1 || Desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT))
+      return E_INVALIDARG;
+
+    if (Desc.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) {
+      // Textures with UNKNOWN layout without MSAA and without render-target nor depth-stencil flags may be created with
+      // 4KB Alignment
+      if (Desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
+        return E_INVALIDARG;
+      if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        return E_INVALIDARG;
+      if (Desc.SampleDesc.Count > 1)
+        return E_INVALIDARG;
+
+      WMTTextureInfo info_one_slice = InfoOut;
+      info_one_slice.mipmap_level_count = 1;
+      info_one_slice.array_length = 1;
+      auto size_and_align = Device.heapTextureSizeAndAlign(info_one_slice);
+      // Applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
+      // total of the larger alignment restriction or less.
+      if (size_and_align.size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+        return E_INVALIDARG;
+    }
+  }
+
   return S_OK;
 };
 
@@ -141,6 +168,8 @@ EncodeComponentMapping(UINT Shader4ComponentMapping, WMTPixelFormat Format) {
 
 class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
+  D3D12_HEAP_PROPERTIES heap_props_;
+  D3D12_HEAP_FLAGS heap_flags_;
 
 public:
   MTLD3D12Texture(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
@@ -148,10 +177,12 @@ public:
   HRESULT
   Initialize(
       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,
-      D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap
+      D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap, UINT64 HeapOffset
   ) {
     // TODO: validate and normalize
     desc_ = *pDesc;
+    heap_props_ = *pHeapProps;
+    heap_flags_ = HeapFlags;
 
     switch (InitialState) {
     case D3D12_RESOURCE_STATE_RENDER_TARGET: {
@@ -171,16 +202,31 @@ public:
     if (!desc_.MipLevels)
       desc_.MipLevels = texture_info.mipmap_level_count;
 
+    if (!desc_.Alignment) {
+      desc_.Alignment = desc_.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                                   : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    }
+
+    if (pHeap) {
+      auto size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+      if (size_and_align.size + HeapOffset > pHeap->GetDesc().SizeInBytes)
+        return E_INVALIDARG;
+    }
+
     texture = new Texture(texture_info, device_->GetMTLDevice());
     Flags<TextureAllocationFlag> flags = {};
-    texture->rename(texture->allocate(flags));
-    device_->RegisterResidency(texture->current()->texture());
+    if (pHeap) {
+      texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
+    } else {
+      texture->rename(texture->allocate(flags));
+      device_->RegisterResidency(texture->current()->texture());
+    }
 
     return S_OK;
   };
 
   ~MTLD3D12Texture() {
-    if (texture)
+    if (texture && texture->current() && !texture->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
       device_->UnregisterResidency(texture->current()->texture());
   }
 
@@ -207,7 +253,16 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   Map(UINT Subresource, const D3D12_RANGE *pReadRange, void **ppData) {
-    return E_NOTIMPL;
+    if (!IsCpuVisibleHeap(&heap_props_))
+      return E_INVALIDARG;
+    UINT subresource_count = desc_.MipLevels;
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+      subresource_count *= desc_.DepthOrArraySize;
+    if (Subresource >= subresource_count)
+      return E_INVALIDARG;
+    if (ppData || (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc_.MipLevels > 1))
+      return E_INVALIDARG;
+    return S_OK;
   };
 
   virtual void STDMETHODCALLTYPE Unmap(UINT Subresource, const D3D12_RANGE *pWrittenRange) {};
@@ -227,19 +282,83 @@ public:
   WriteToSubresource(
       UINT DstSubresource, const D3D12_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch, UINT SrcSlicePitch
   ) {
-    return E_NOTIMPL;
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+      SrcSlicePitch = 0;
+    if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+      return E_INVALIDARG;
+    uint32_t Level = 0, Slice = 0, Plane = 0;
+    DecomposeSubresource(desc_, DstSubresource, &Level, &Slice, &Plane);
+    if (Plane)
+      return E_INVALIDARG;
+    D3D12_BOX full_box = GetResourceExtent(desc_, Level);
+    D3D12_BOX box = pDstBox ? *pDstBox : full_box;
+
+    if (!IsD3D12BoxInBounds(box, full_box))
+      return E_INVALIDARG;
+
+    if (box.left == box.right || box.top == box.bottom || box.front == box.back)
+      return S_OK;
+
+    MTL_DXGI_FORMAT_DESC Format;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
+      return E_INVALIDARG;
+
+    if (Format.Flag & MTL_DXGI_FORMAT_BC) {
+      if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
+        return E_INVALIDARG;
+    }
+
+    texture->current()->texture().replaceRegion(
+        {box.left, box.top, box.front}, {box.right - box.left, box.bottom - box.top, box.back - box.front}, Level,
+        Slice, pSrcData, SrcRowPitch, SrcSlicePitch
+    );
+    return S_OK;
   };
 
   virtual HRESULT STDMETHODCALLTYPE
   ReadFromSubresource(
       void *pDstData, UINT DstRowPitch, UINT DstSlicePitch, UINT SrcSubresource, const D3D12_BOX *pSrcBox
   ) {
-    return E_NOTIMPL;
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+      DstSlicePitch = 0;
+    if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+      return E_INVALIDARG;
+    uint32_t Level = 0, Slice = 0, Plane = 0;
+    DecomposeSubresource(desc_, SrcSubresource, &Level, &Slice, &Plane);
+    if (Plane)
+      return E_INVALIDARG;
+    D3D12_BOX full_box = GetResourceExtent(desc_, Level);
+    D3D12_BOX box = pSrcBox ? *pSrcBox : full_box;
+
+    if (!IsD3D12BoxInBounds(box, full_box))
+      return E_INVALIDARG;
+
+    if (box.left == box.right || box.top == box.bottom || box.front == box.back)
+      return S_OK;
+
+    MTL_DXGI_FORMAT_DESC Format;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
+      return E_INVALIDARG;
+
+    if (Format.Flag & MTL_DXGI_FORMAT_BC) {
+      if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
+        return E_INVALIDARG;
+    }
+
+    texture->current()->texture().getBytes(
+        {box.left, box.top, box.front}, {box.right - box.left, box.bottom - box.top, box.back - box.front}, Level,
+        Slice, pDstData, DstRowPitch, DstSlicePitch
+    );
+    return S_OK;
   };
 
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {
-    return E_NOTIMPL;
+    if (pHeapProps)
+      *pHeapProps = heap_props_;
+    if (pFlags)
+      *pFlags = heap_flags_;
+    return S_OK;
   };
 
   virtual HRESULT STDMETHODCALLTYPE
@@ -594,20 +713,9 @@ public:
       view_descriptor.firstArraySlice = 0;
       view_descriptor.arraySize = 1;
       auto ArraySize = std::max<UINT16>(desc_.DepthOrArraySize >> ViewDesc.Texture3D.MipSlice, 1);
-      RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
-
-      if (ViewDesc.Texture3D.WSize == 1) {
-        RenderTargetDesc.DepthPlane = ViewDesc.Texture3D.FirstWSlice;
-      } else if (ViewDesc.Texture3D.FirstWSlice == 0) {
-        if (ArraySize != ViewDesc.Texture3D.WSize) {
-          WARN("Created a subview of 3D texture.");
-        }
-        RenderTargetDesc.RenderTargetArrayLength = ArraySize;
-      } else {
-        ERR("Failed to create 3D RTV, FirstWSlice:", ViewDesc.Texture3D.FirstWSlice,
-            " WSize:", ViewDesc.Texture3D.WSize, " MippedDepth:", ArraySize);
-      }
-
+      RenderTargetDesc.DepthPlane = ViewDesc.Texture3D.FirstWSlice;
+      RenderTargetDesc.RenderTargetArrayLength = ViewDesc.Texture3D.WSize == ~0u ? ArraySize : ViewDesc.Texture3D.WSize;
+      View = texture->createView(view_descriptor);
       break;
     }
     default:
@@ -739,7 +847,7 @@ CreateCommittedTexture(
     REFIID riid, void **ppResource
 ) {
   auto texture = Com(new MTLD3D12Texture(pDevice));
-  HRESULT hr = texture->Initialize(pHeapProps, HeapFlags, pDesc, InitialState, nullptr);
+  HRESULT hr = texture->Initialize(pHeapProps, HeapFlags, pDesc, InitialState, nullptr, 0);
   if (FAILED(hr))
     return hr;
   if (!ppResource)
@@ -749,16 +857,21 @@ CreateCommittedTexture(
 
 HRESULT
 CreatePlacedTexture(
-    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
-    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
+    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC *pDesc,
+    D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 ) {
   auto texture = Com(new MTLD3D12Texture(pDevice));
   D3D12_HEAP_DESC heap_desc = pHeap->GetDesc();
 
-  if (heap_desc.Flags & D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)
-    return E_INVALIDARG;
+  if (pDesc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+    if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)
+      return E_INVALIDARG;
+  } else {
+    if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)
+      return E_INVALIDARG;
+  }
 
-  HRESULT hr = texture->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, InitialState, pHeap);
+  HRESULT hr = texture->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, InitialState, pHeap, HeapOffset);
   if (FAILED(hr))
     return hr;
   if (!ppResource)

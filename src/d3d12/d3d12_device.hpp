@@ -26,6 +26,7 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_command.hpp"
 #include "dxmt_fence.hpp"
+#include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
 #include "dxmt_texture.hpp"
 #include "log/log.hpp"
@@ -39,7 +40,7 @@
 
 namespace dxmt {
 
-class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList {
+class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList2 {
 public:
   EncoderData *entry;
   size_t encoder_count;
@@ -55,7 +56,7 @@ public:
 
 class MTLD3D12CommandQueue : public ID3D12CommandQueue {
 public:
-  virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable) = 0;
+  virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) = 0;
 };
 
 class MTLD3D12Resource : public ID3D12Resource {
@@ -84,6 +85,7 @@ public:
 
 class MTLD3D12Heap : public ID3D12Heap {
 public:
+  WMT::Reference<WMT::Heap> heap;
 };
 
 class MTLD3D12Fence : public ID3D12Fence1 {
@@ -127,12 +129,14 @@ public:
 class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
   UINT IsComputePipelineState;
+
+  static HRESULT
+  InitializeShader(D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl);
 };
 
 class MTLD3D12GraphicsPipelineState : public MTLD3D12PipelineState {
 public:
   WMT::Reference<WMT::RenderPipelineState> pso;
-  WMT::Reference<WMT::DepthStencilState> dsso;
   uint32_t slot_mask = 0;
   enum WMTTriangleFillMode fill_mode;
   enum WMTCullMode cull_mode;
@@ -142,6 +146,8 @@ public:
   float scole_scale;
   float depth_bias_clamp;
   uint32_t forced_sample_count;
+
+  virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
 
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
@@ -156,11 +162,13 @@ public:
   virtual void ReleasePrivate() = 0;
 };
 
-class MTLD3D12Device : public ID3D12Device1 {
+class MTLD3D12Device : public ID3D12Device4 {
 public:
   virtual WMT::Device GetMTLDevice() = 0;
 
   virtual D3D_FEATURE_LEVEL GetFeatureLevel() = 0;
+
+  virtual HRESULT GetAdapter(REFIID riid, void **ppAdapter) = 0;
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
 
@@ -176,7 +184,11 @@ public:
 
   virtual InternalCommandLibrary& GetLib() = 0;
 
+  virtual FormatCapability GetMTLPixelFormatCapability(WMTPixelFormat Format) = 0;
+
   EventListener event_listener;
+
+  WMT::Reference<WMT::DepthStencilState> default_depth_stencil_state;
 };
 
 HRESULT CreateD3D12Device(IMTLDXGIAdapter *adapter, REFIID riid, void **ppDevice);
@@ -203,8 +215,8 @@ HRESULT CreateCommittedTexture(
 
 HRESULT
 CreatePlacedTexture(
-    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
-    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
+    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC *pDesc,
+    D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 );
 
 HRESULT CreateCommittedBuffer(
@@ -215,8 +227,8 @@ HRESULT CreateCommittedBuffer(
 
 HRESULT
 CreatePlacedBuffer(
-    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
-    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
+    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC *pDesc,
+    D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 );
 
 HRESULT
@@ -329,8 +341,19 @@ constexpr auto kDefaultShader4Component = 0b1'011'010'001'000;
 
 HRESULT ValidateResourceStates(D3D12_RESOURCE_STATES State, const D3D12_HEAP_PROPERTIES *pHeapProps);
 
-HRESULT ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, D3D12_HEAP_TYPE HeapType);
+HRESULT ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, const D3D12_HEAP_PROPERTIES *pHeapProps);
 
 HRESULT ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS Flags, bool AdapterIsNUMA);
+
+D3D12_BOX GetResourceExtent(const D3D12_RESOURCE_DESC &Desc, UINT MipSlice);
+
+UINT DecomposeSubresource(
+    const D3D12_RESOURCE_DESC &Desc, UINT Subresource = 0, UINT *pMipSlice = NULL, UINT *pArraySlice = NULL,
+    UINT *pPlaneSlice = NULL
+);
+
+bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
+
+bool IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds);
 
 } // namespace dxmt

@@ -20,6 +20,7 @@
 
 #include "d3d12_pageable.hpp"
 #include "dxmt_command_clear.hpp"
+#include "dxmt_ring_bump_allocator.hpp"
 
 namespace dxmt {
 
@@ -71,7 +72,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   friend struct SimpleCommandContext<MTLD3D12CommandAllocatorImpl>;
 
   D3D12_COMMAND_LIST_TYPE type_;
-  
+
+  std::vector<void *> spilled_cpu_heap_;
   void *cpu_heap_ = nullptr;
   size_t cpu_heap_offset_;
 
@@ -89,6 +91,10 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   small_vector<WMT::Reference<WMT::IndirectCommandBuffer>, 4> icb_;
 
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
+  ClearRTV<MTLD3D12CommandAllocatorImpl> clear_rtv_;
+
+  RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator_;
+  uint64_t copy_temp_version_;
 
 public:
   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
@@ -148,11 +154,19 @@ public:
 
   void *
   AllocateCPUHeap(size_t Length, size_t Alignment) {
-    std::size_t adjustment = align_forward_adjustment((void *)cpu_heap_offset_, Alignment);
-    auto aligned = cpu_heap_offset_ + adjustment;
-    cpu_heap_offset_ = aligned + Length;
-    assert(cpu_heap_offset_ < kCPUHeapSize);
-    return ptr_add(cpu_heap_, aligned);
+    assert(Length < kCPUHeapSize);
+    for (;;) {
+      std::size_t adjustment = align_forward_adjustment((void *)cpu_heap_offset_, Alignment);
+      auto aligned = cpu_heap_offset_ + adjustment;
+      cpu_heap_offset_ = aligned + Length;
+      if (unlikely(cpu_heap_offset_ >= kCPUHeapSize)) {
+        spilled_cpu_heap_.push_back(cpu_heap_);
+        cpu_heap_ = malloc(kCPUHeapSize);
+        cpu_heap_offset_ = 0;
+        continue;
+      }
+      return ptr_add(cpu_heap_, aligned);
+    }
   }
 
   template <typename T>
@@ -214,6 +228,13 @@ public:
     gpu_heap_offset_ = aligned + Length;
     assert(gpu_heap_offset_ < kGPUHeapSize);
     return {ptr_add(gpu_heap_, aligned), aligned};
+  }
+
+  std::tuple<WMT::Buffer, uint64_t>
+  AllocateTempBuffer(size_t Size, size_t Alignment) {
+    assert(copy_temp_version_);
+    auto [block, offset] = copy_temp_allocator_.allocate(copy_temp_version_, copy_temp_version_ - 1, Size, Alignment);
+    return {block.buffer, offset};
   }
 
   IndirectComputeCommandData *EncodeIndirectComputeCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount);

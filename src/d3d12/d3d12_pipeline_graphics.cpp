@@ -18,11 +18,12 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "d3d12_pipeline.hpp"
 #include "dxmt_format.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "sha1/sha1_util.hpp"
-#include "airconv_public.h"
+#include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/DXBCUtils.h"
 
 namespace dxmt {
@@ -230,12 +231,39 @@ ExtractMTLInputLayoutElements(
   return S_OK;
 }
 
-class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12Pageable<MTLD3D12GraphicsPipelineState> {
+HRESULT
+MTLD3D12PipelineState::InitializeShader(
+    D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
+) {
+  using namespace microsoft;
+  HRESULT hr;
+  CDXBCParser Parser;
+  if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength)))
+    return hr;
 
-  sm50_shader_t shader_vs;
-  sm50_shader_t shader_ps;
+  if (Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL) != DXBC_BLOB_NOT_FOUND)
+    return E_NOTIMPL;
+
+  SM50Error error;
+  if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
+    ERR("Failed to initialize shader: ", SM50GetErrorMessageString(error));
+    return E_FAIL;
+  }
+
+  return S_OK;
+}
+
+class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12Pageable<MTLD3D12GraphicsPipelineState> {
+protected:
   MTL_SHADER_REFLECTION ref_vs;
   MTL_SHADER_REFLECTION ref_ps;
+
+  WMT::Reference<WMT::DepthStencilState> dsso;
+  WMT::Reference<WMT::DepthStencilState> dsso_depth_readonly;
+  WMT::Reference<WMT::DepthStencilState> dsso_stencil_readonly;
+  WMT::Reference<WMT::DepthStencilState> dsso_readonly;
+  WMT::Reference<WMT::DepthStencilState> dsso_no_stencil;
+  WMT::Reference<WMT::DepthStencilState> dsso_readonly_no_stencil;
 
 public:
   MTLD3D12GraphicsPipelineStateImpl(MTLD3D12Device *pDevice) :
@@ -248,7 +276,195 @@ public:
     return (Blend >= D3D12_BLEND_SRC1_COLOR) && (Blend <= D3D12_BLEND_INV_SRC1_ALPHA);
   }
 
+  template <typename RenderPipelineInfo>
   HRESULT
+  InitializePSO(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, RenderPipelineInfo &info, bool &dual_source_blending) {
+    HRESULT hr;
+    MTL_DXGI_FORMAT_DESC format_desc;
+    uint32_t effective_dual_source_rtvs = 0;
+    for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
+      if (pDesc->RTVFormats[i] == DXGI_FORMAT_UNKNOWN)
+        continue;
+      if (i >= 2 && dual_source_blending)
+        break;
+      auto &rt = info.colors[i];
+      auto Format = pDesc->RTVFormats[i];
+      if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc))) {
+        return hr;
+      }
+      rt.pixel_format = format_desc.PixelFormat;
+
+      auto renderTarget = pDesc->BlendState.RenderTarget[pDesc->BlendState.IndependentBlendEnable ? i : 0];
+
+      if (renderTarget.BlendEnable && renderTarget.LogicOpEnable)
+        return E_INVALIDARG;
+
+      if (pDesc->BlendState.IndependentBlendEnable && renderTarget.LogicOpEnable)
+        return E_INVALIDARG;
+
+      rt.write_mask = kColorWriteMaskMap[renderTarget.RenderTargetWriteMask];
+
+      if (rt.pixel_format == WMTPixelFormatRGB9E5Float)
+        rt.write_mask = (rt.write_mask & ~WMTColorWriteMaskAlpha) ? WMTColorWriteMaskAll : 0;
+
+      if (renderTarget.BlendEnable) {
+        if (!any_bit_set(device_->GetMTLPixelFormatCapability(rt.pixel_format) & FormatCapability::Blend)) {
+          WARN("CreateGraphicsPipelineState: pixel format ", rt.pixel_format, " is not blendable");
+          return E_INVALIDARG;
+        }
+        if (BlendFactorIsDualSource(renderTarget.SrcBlendAlpha) || BlendFactorIsDualSource(renderTarget.SrcBlend) ||
+            BlendFactorIsDualSource(renderTarget.DestBlendAlpha) || BlendFactorIsDualSource(renderTarget.DestBlend)) {
+          dual_source_blending = true;
+        }
+        rt.alpha_blend_operation = kBlendOpMap[renderTarget.BlendOpAlpha];
+        rt.rgb_blend_operation = kBlendOpMap[renderTarget.BlendOp];
+        rt.blending_enabled = renderTarget.BlendEnable;
+        rt.src_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.SrcBlendAlpha];
+        rt.src_rgb_blend_factor = kBlendFactorMap[renderTarget.SrcBlend];
+        rt.dst_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.DestBlendAlpha];
+        rt.dst_rgb_blend_factor = kBlendFactorMap[renderTarget.DestBlend];
+      }
+      if (i < 2)
+        effective_dual_source_rtvs++;
+    }
+
+    if (dual_source_blending && effective_dual_source_rtvs > 1)
+      return E_INVALIDARG;
+
+    if (pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN) {
+      if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->DSVFormat, format_desc))) {
+        return hr;
+      }
+      auto dsv_flags = DepthStencilPlanarFlags(format_desc.PixelFormat);
+      if (dsv_flags & 1)
+        info.depth_pixel_format = format_desc.PixelFormat;
+      if (dsv_flags & 2)
+        info.stencil_pixel_format = format_desc.PixelFormat;
+    }
+
+    if constexpr (std::is_same_v<RenderPipelineInfo, WMTRenderPipelineInfo>) {
+      switch (pDesc->PrimitiveTopologyType) {
+      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT:
+        info.input_primitive_topology = WMTPrimitiveTopologyClassPoint;
+        break;
+      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE:
+        info.input_primitive_topology = WMTPrimitiveTopologyClassLine;
+        break;
+      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE:
+      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH:
+        info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+        break;
+      default:
+        break;
+      }
+    }
+
+    info.raster_sample_count = pDesc->SampleDesc.Count;
+    info.support_indirect_command_buffers = true;
+
+    info.alpha_to_coverage_enabled = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput;
+
+    return S_OK;
+  }
+
+  void
+  InitializeDSSO(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+    WMTDepthStencilInfo info;
+    info.depth_compare_function = WMTCompareFunctionAlways;
+    info.depth_write_enabled = false;
+    info.front_stencil.enabled = false;
+    info.back_stencil.enabled = false;
+    if (pDesc->DepthStencilState.DepthEnable) {
+      info.depth_compare_function = kCompareFunctionMap[pDesc->DepthStencilState.DepthFunc];
+      info.depth_write_enabled = pDesc->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+    }
+
+    if (pDesc->DepthStencilState.StencilEnable) {
+      info.front_stencil.enabled = true;
+      info.back_stencil.enabled = true;
+
+      info.front_stencil.depth_stencil_pass_op = kStencilOperationMap[pDesc->DepthStencilState.FrontFace.StencilPassOp];
+      info.front_stencil.stencil_fail_op = kStencilOperationMap[pDesc->DepthStencilState.FrontFace.StencilFailOp];
+      info.front_stencil.depth_fail_op = kStencilOperationMap[pDesc->DepthStencilState.FrontFace.StencilDepthFailOp];
+      info.front_stencil.stencil_compare_function = kCompareFunctionMap[pDesc->DepthStencilState.FrontFace.StencilFunc];
+      info.front_stencil.write_mask = pDesc->DepthStencilState.StencilWriteMask;
+      info.front_stencil.read_mask = pDesc->DepthStencilState.StencilReadMask;
+
+      info.back_stencil.depth_stencil_pass_op = kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilPassOp];
+      info.back_stencil.stencil_fail_op = kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilFailOp];
+      info.back_stencil.depth_fail_op = kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilDepthFailOp];
+      info.back_stencil.stencil_compare_function = kCompareFunctionMap[pDesc->DepthStencilState.BackFace.StencilFunc];
+      info.back_stencil.write_mask = pDesc->DepthStencilState.StencilWriteMask;
+      info.back_stencil.read_mask = pDesc->DepthStencilState.StencilReadMask;
+    }
+
+    auto metal = device_->GetMTLDevice();
+    dsso = metal.newDepthStencilState(info);
+    {
+      auto info_depth_readonly = info;
+      info_depth_readonly.depth_write_enabled = false;
+      dsso_depth_readonly = metal.newDepthStencilState(info_depth_readonly);
+    }
+    {
+      auto info_stencil_readonly = info;
+      info_stencil_readonly.back_stencil.stencil_fail_op = WMTStencilOperationKeep;
+      info_stencil_readonly.back_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
+      info_stencil_readonly.back_stencil.depth_fail_op = WMTStencilOperationKeep;
+      info_stencil_readonly.front_stencil.stencil_fail_op = WMTStencilOperationKeep;
+      info_stencil_readonly.front_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
+      info_stencil_readonly.front_stencil.depth_fail_op = WMTStencilOperationKeep;
+      dsso_stencil_readonly = metal.newDepthStencilState(info_stencil_readonly);
+    }
+    {
+      auto info_readonly = info;
+      info_readonly.depth_write_enabled = false;
+      info_readonly.back_stencil.stencil_fail_op = WMTStencilOperationKeep;
+      info_readonly.back_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
+      info_readonly.back_stencil.depth_fail_op = WMTStencilOperationKeep;
+      info_readonly.front_stencil.stencil_fail_op = WMTStencilOperationKeep;
+      info_readonly.front_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
+      info_readonly.front_stencil.depth_fail_op = WMTStencilOperationKeep;
+      dsso_readonly = metal.newDepthStencilState(info_readonly);
+    }
+    {
+      auto info_nostencil = info;
+      info_nostencil.back_stencil.enabled = false;
+      info_nostencil.front_stencil.enabled = false;
+      dsso_no_stencil = metal.newDepthStencilState(info_nostencil);
+    }
+    {
+      auto info_nostencil = info;
+      info_nostencil.depth_write_enabled = false;
+      info_nostencil.back_stencil.enabled = false;
+      info_nostencil.front_stencil.enabled = false;
+      dsso_readonly_no_stencil = metal.newDepthStencilState(info_nostencil);
+    }
+  }
+
+  void
+  InitializeRasterizerState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+    fill_mode =
+        pDesc->RasterizerState.FillMode == D3D12_FILL_MODE_SOLID ? WMTTriangleFillModeFill : WMTTriangleFillModeLines;
+    switch (pDesc->RasterizerState.CullMode) {
+    case D3D12_CULL_MODE_BACK:
+      cull_mode = WMTCullModeBack;
+      break;
+    case D3D12_CULL_MODE_FRONT:
+      cull_mode = WMTCullModeFront;
+      break;
+    case D3D12_CULL_MODE_NONE:
+      cull_mode = WMTCullModeNone;
+      break;
+    }
+    depth_clip_mode = pDesc->RasterizerState.DepthClipEnable ? WMTDepthClipModeClip : WMTDepthClipModeClamp;
+    depth_bias = pDesc->RasterizerState.DepthBias;
+    scole_scale = pDesc->RasterizerState.SlopeScaledDepthBias;
+    depth_bias_clamp = pDesc->RasterizerState.DepthBiasClamp;
+    winding = pDesc->RasterizerState.FrontCounterClockwise ? WMTWindingCounterClockwise : WMTWindingClockwise;
+    forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
+  }
+
+  virtual HRESULT
   Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
     if (pDesc->StreamOutput.NumEntries) {
       ERR("CreatePipelineState: SO not supported");
@@ -266,7 +482,9 @@ public:
     }
 
     HRESULT hr;
-    sm50_error_t sm50_err;
+
+    SM50Shader shader_vs, shader_ps;
+    SM50Error sm50_err;
     auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> err;
     WMT::Reference<WMT::Function> vs_func, ps_func;
@@ -278,10 +496,8 @@ public:
     common.next = nullptr;
 
     if (pDesc->VS.pShaderBytecode) {
-      if (SM50Initialize(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength, &shader_vs, &ref_vs, &sm50_err)) {
-        ERR("Failed to parse vs shader");
-        return E_FAIL;
-      }
+      if (FAILED(hr = InitializeShader(pDesc->VS, &shader_vs, &ref_vs)))
+        return hr;
       SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
       data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
       data_ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
@@ -313,7 +529,7 @@ public:
       }
       rootsig.next = &data_ia_layout;
 
-      sm50_bitcode_t vs_bitcode;
+      SM50ShaderBitcode vs_bitcode;
 
       if (SM50Compile(
               shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
@@ -337,77 +553,16 @@ public:
 
     bool dual_source_blending = false;
 
-    uint32_t effective_dual_source_rtvs = 0;
-
-    // PSO
-    {
-      MTL_DXGI_FORMAT_DESC format_desc;
-      for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
-        if (pDesc->RTVFormats[i] == DXGI_FORMAT_UNKNOWN)
-          continue;
-        if (i >= 2 && dual_source_blending)
-          break;
-        auto &rt = info.colors[i];
-        auto Format = pDesc->RTVFormats[i];
-        if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc))) {
-          return hr;
-        }
-        rt.pixel_format = format_desc.PixelFormat;
-
-        auto renderTarget = pDesc->BlendState.RenderTarget[pDesc->BlendState.IndependentBlendEnable ? i : 0];
-
-        if (renderTarget.BlendEnable && renderTarget.LogicOpEnable)
-          return E_INVALIDARG;
-
-        if (pDesc->BlendState.IndependentBlendEnable && renderTarget.LogicOpEnable)
-          return E_INVALIDARG;
-
-        rt.write_mask = kColorWriteMaskMap[renderTarget.RenderTargetWriteMask];
-        if (renderTarget.BlendEnable) {
-          // TODO
-          // if (!any_bit_set(device_->GetMTLPixelFormatCapability(rt.pixel_format) & FormatCapability::Blend)) {
-          //   return E_INVALIDARG;
-          // }
-          if (BlendFactorIsDualSource(renderTarget.SrcBlendAlpha) || BlendFactorIsDualSource(renderTarget.SrcBlend) ||
-              BlendFactorIsDualSource(renderTarget.DestBlendAlpha) || BlendFactorIsDualSource(renderTarget.DestBlend)) {
-            dual_source_blending = true;
-          }
-          rt.alpha_blend_operation = kBlendOpMap[renderTarget.BlendOpAlpha];
-          rt.rgb_blend_operation = kBlendOpMap[renderTarget.BlendOp];
-          rt.blending_enabled = renderTarget.BlendEnable;
-          rt.src_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.SrcBlendAlpha];
-          rt.src_rgb_blend_factor = kBlendFactorMap[renderTarget.SrcBlend];
-          rt.dst_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.DestBlendAlpha];
-          rt.dst_rgb_blend_factor = kBlendFactorMap[renderTarget.DestBlend];
-        }
-        if (i < 2)
-          effective_dual_source_rtvs++;
-      }
-
-      if (dual_source_blending && effective_dual_source_rtvs > 1)
-        return E_INVALIDARG;
-
-      if (pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN) {
-        if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->DSVFormat, format_desc))) {
-          return hr;
-        }
-        auto dsv_flags = DepthStencilPlanarFlags(format_desc.PixelFormat);
-        if (dsv_flags & 1)
-          info.depth_pixel_format = format_desc.PixelFormat;
-        if (dsv_flags & 2)
-          info.stencil_pixel_format = format_desc.PixelFormat;
-      }
-    }
+    if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
+      return hr;
 
     if (pDesc->PS.pShaderBytecode) {
       auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
 
       std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
 
-      if (SM50Initialize(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength, &shader_ps, &ref_ps, &sm50_err)) {
-        ERR("Failed to parse ps shader");
-        return E_FAIL;
-      }
+      if (FAILED(hr = InitializeShader(pDesc->PS, &shader_ps, &ref_ps)))
+        return hr;
       SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
       data_ps.dual_source_blending = dual_source_blending;
       data_ps.disable_depth_output = false;
@@ -415,6 +570,11 @@ public:
       data_ps.sample_mask = pDesc->SampleMask;
       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
       data_ps.next = &common;
+
+      memset(data_ps.pixel_formats, 0, sizeof(data_ps.pixel_formats));
+      for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
+        data_ps.pixel_formats[i] = ORIGINAL_FORMAT(info.colors[i].pixel_format);
+      }
 
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
@@ -427,7 +587,7 @@ public:
       }
       rootsig.next = &data_ps;
 
-      sm50_bitcode_t ps_bitcode;
+      SM50ShaderBitcode ps_bitcode;
       if (SM50Compile(
               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
           )) {
@@ -446,24 +606,6 @@ public:
       info.vertex_function = vs_func.handle;
       info.fragment_function = ps_func.handle;
 
-      switch (pDesc->PrimitiveTopologyType) {
-      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT:
-        info.input_primitive_topology = WMTPrimitiveTopologyClassPoint;
-        break;
-      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE:
-        info.input_primitive_topology = WMTPrimitiveTopologyClassLine;
-        break;
-      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE:
-      case D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH:
-        info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-        break;
-      default:
-        break;
-      }
-
-      info.raster_sample_count = pDesc->SampleDesc.Count;
-      info.support_indirect_command_buffers = true;
-
       pso = metal.newRenderPipelineState(info, err);
 
       if (!pso) {
@@ -473,73 +615,9 @@ public:
     }
 
     // DSSO
-    {
-      WMTDepthStencilInfo info;
-      info.depth_compare_function = WMTCompareFunctionAlways;
-      info.depth_write_enabled = false;
-      info.front_stencil.enabled = false;
-      info.back_stencil.enabled = false;
-      if (pDesc->DepthStencilState.DepthEnable) {
-        info.depth_compare_function = kCompareFunctionMap[pDesc->DepthStencilState.DepthFunc];
-        info.depth_write_enabled = pDesc->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
-      }
+    InitializeDSSO(pDesc);
 
-      if (pDesc->DepthStencilState.StencilEnable) {
-        info.front_stencil.enabled = true;
-        info.back_stencil.enabled = true;
-        {
-          info.front_stencil.depth_stencil_pass_op =
-              (kStencilOperationMap[pDesc->DepthStencilState.FrontFace.StencilPassOp]);
-          info.front_stencil.stencil_fail_op = (kStencilOperationMap[pDesc->DepthStencilState.FrontFace.StencilFailOp]);
-          info.front_stencil.depth_fail_op =
-              (kStencilOperationMap[pDesc->DepthStencilState.FrontFace.StencilDepthFailOp]);
-          info.front_stencil.stencil_compare_function =
-              kCompareFunctionMap[pDesc->DepthStencilState.FrontFace.StencilFunc];
-          info.front_stencil.write_mask = pDesc->DepthStencilState.StencilWriteMask;
-          info.front_stencil.read_mask = pDesc->DepthStencilState.StencilReadMask;
-        }
-        {
-          info.back_stencil.depth_stencil_pass_op =
-              (kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilPassOp]);
-          info.back_stencil.stencil_fail_op = (kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilFailOp]);
-          info.back_stencil.depth_fail_op =
-              (kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilDepthFailOp]);
-          info.back_stencil.stencil_compare_function =
-              kCompareFunctionMap[pDesc->DepthStencilState.BackFace.StencilFunc];
-          info.back_stencil.write_mask = pDesc->DepthStencilState.StencilWriteMask;
-          info.back_stencil.read_mask = pDesc->DepthStencilState.StencilReadMask;
-        }
-      }
-
-      dsso = metal.newDepthStencilState(info);
-
-      if (!dsso) {
-        ERR("Failed to create DSSO");
-        return E_FAIL;
-      }
-    }
-
-    {
-      fill_mode =
-          pDesc->RasterizerState.FillMode == D3D12_FILL_MODE_SOLID ? WMTTriangleFillModeFill : WMTTriangleFillModeLines;
-      switch (pDesc->RasterizerState.CullMode) {
-      case D3D12_CULL_MODE_BACK:
-        cull_mode = WMTCullModeBack;
-        break;
-      case D3D12_CULL_MODE_FRONT:
-        cull_mode = WMTCullModeFront;
-        break;
-      case D3D12_CULL_MODE_NONE:
-        cull_mode = WMTCullModeNone;
-        break;
-      }
-      depth_clip_mode = pDesc->RasterizerState.DepthClipEnable ? WMTDepthClipModeClip : WMTDepthClipModeClamp;
-      depth_bias = pDesc->RasterizerState.DepthBias;
-      scole_scale = pDesc->RasterizerState.SlopeScaledDepthBias;
-      depth_bias_clamp = pDesc->RasterizerState.DepthBiasClamp;
-      winding = pDesc->RasterizerState.FrontCounterClockwise ? WMTWindingCounterClockwise : WMTWindingClockwise;
-      forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
-    }
+    InitializeRasterizerState(pDesc);
 
     return S_OK;
   }
@@ -569,6 +647,32 @@ public:
   GetCachedBlob(ID3DBlob **blob) {
     IMPLEMENT_ME
     return E_NOTIMPL;
+  }
+
+  virtual WMT::DepthStencilState
+  GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) {
+    if (!DSVPlanar)
+      return device_->default_depth_stencil_state;
+
+    if (DSVPlanar == 1) {
+      if (DSVReadonlyFlags & 1)
+        return dsso_readonly_no_stencil;
+      else
+        return dsso_no_stencil;
+    }
+
+    assert(DSVPlanar == 3);
+
+    switch (DSVReadonlyFlags) {
+    case 3:
+      return dsso_readonly;
+    case 2:
+      return dsso_stencil_readonly;
+    case 1:
+      return dsso_depth_readonly;
+    default:
+      return dsso;
+    }
   }
 };
 

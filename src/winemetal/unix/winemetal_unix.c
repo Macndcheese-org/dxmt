@@ -781,6 +781,11 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
                            withRange:NSMakeRange(body->location, body->length)];
       break;
     }
+    case WMTBlitCommandCopyTexture: {
+      struct wmtcmd_blit_copy_texture *body = (struct wmtcmd_blit_copy_texture *)next;
+      [encoder copyFromTexture:(id<MTLTexture>)body->src toTexture:(id<MTLTexture>)body->dst];
+      break;
+    }
     }
 
     next = next->next.ptr;
@@ -976,6 +981,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_setdsso *body = (struct wmtcmd_render_setdsso *)next;
       [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->dsso];
       [encoder setStencilReferenceValue:body->stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetDepthStencilState: {
+      struct wmtcmd_render_setdepthstencilstate *body = (struct wmtcmd_render_setdepthstencilstate *)next;
+      [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->depth_stencil_state];
       break;
     }
     case WMTRenderCommandSetBlendFactorAndStencilRef: {
@@ -1519,19 +1529,51 @@ _NSString_alloc_init(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static bool
+developer_hud_uses_metric_service(void) {
+  NSOperatingSystemVersion version = [NSProcessInfo processInfo].operatingSystemVersion;
+  return version.majorVersion >= 27;
+}
+
 static NTSTATUS
 _DeveloperHUDProperties_instance(void *obj) {
   struct unixcall_generic_obj_ret *params = obj;
+  Class cls = objc_lookUpClass(
+      developer_hud_uses_metric_service()
+          ? "MTLHUDService"
+          : "_CADeveloperHUDProperties"
+  );
   params->ret =
-      (obj_handle_t)((id(*)(id, SEL))objc_msgSend)(objc_lookUpClass("_CADeveloperHUDProperties"), @selector(instance));
+      (obj_handle_t)((id(*)(id, SEL))objc_msgSend)((id)cls, @selector(instance));
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _DeveloperHUDProperties_addLabel(void *obj) {
   struct unixcall_generic_obj_obj_obj_uint64_ret *params = obj;
-  params->ret = ((bool (*)(id, SEL, id, id)
-  )objc_msgSend)((id)params->handle, @selector(addLabel:after:), (id)params->arg0, (id)params->arg1);
+  if (developer_hud_uses_metric_service()) {
+    params->ret =
+        ((bool (*)(id, SEL, id, id, id, id, uint32_t, uint32_t, uint32_t, uint64_t))objc_msgSend)(
+            (id)params->handle,
+            @selector(insertMetric:after:name:unit:nameColor:valueColor:visualType:options:),
+            (id)params->arg0,
+            (id)params->arg1,
+            @"",
+            @"",
+            UINT32_MAX,
+            UINT32_MAX,
+            1u,
+            0u
+        );
+  } else {
+    params->ret =
+        ((bool (*)(id, SEL, id, id))objc_msgSend)(
+            (id)params->handle,
+            @selector(addLabel:after:),
+            (id)params->arg0,
+            (id)params->arg1
+        );
+  }
   return STATUS_SUCCESS;
 }
 
@@ -1880,6 +1922,8 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
+  /** MTLPixelFormat */
+  uint32_t pixel_formats[8];
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -1961,6 +2005,7 @@ sm50_compilation_argument32_convert(
       data->disable_depth_output = src->disable_depth_output;
       data->sample_mask = src->sample_mask;
       data->dual_source_blending = src->dual_source_blending;
+      memcpy(data->pixel_formats, src->pixel_formats, sizeof(data->pixel_formats));
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -2007,7 +2052,8 @@ sm50_compilation_argument32_convert(
       data->max_potential_tess_factor = src->max_potential_tess_factor;
       break;
     }
-    case SM50_SHADER_ROOT_SIGNATURE: {
+    case SM50_SHADER_ROOT_SIGNATURE:
+    case SM50_SHADER_ROOT_SIGNATURE2: {
       struct SM50_SHADER_ROOT_SIGNATURE_DATA32 *src = (void *)args32;
       struct SM50_SHADER_ROOT_SIGNATURE_DATA *data = malloc(sizeof(struct SM50_SHADER_ROOT_SIGNATURE_DATA));
       last_arg->next = data;
@@ -3092,6 +3138,21 @@ _MTLDevice_newLibraryWithSource(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+_MTLTexture_getBytes(void *obj) {
+  struct unixcall_mtltexture_replaceregion *params = obj;
+  [(id<MTLTexture>)params->texture getBytes:params->data.ptr
+                                bytesPerRow:params->bytes_per_row
+                              bytesPerImage:params->bytes_per_image
+                                 fromRegion:MTLRegionMake3D(
+                                                params->origin.x, params->origin.y, params->origin.z,
+                                                params->size.width, params->size.height, params->size.depth
+                                            )
+                                mipmapLevel:params->level
+                                      slice:params->slice];
+  return STATUS_SUCCESS;
+}
+
 /*
  * Definition from cache.c
  */
@@ -3248,6 +3309,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
+    &_MTLTexture_getBytes,
 };
 
 #ifndef DXMT_NATIVE
@@ -3397,5 +3459,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
+    &_MTLTexture_getBytes,
 };
 #endif

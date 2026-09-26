@@ -34,7 +34,7 @@ public:
   HRESULT
   Initialize(
       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,
-      const D3D12_CLEAR_VALUE *OptimizedClearValue, MTLD3D12Heap *pHeap
+      const D3D12_CLEAR_VALUE *OptimizedClearValue, MTLD3D12Heap *pHeap, UINT64 Offset
   ) {
     if (OptimizedClearValue)
       return E_INVALIDARG;
@@ -44,10 +44,26 @@ public:
     heap_props_ = *pHeapProps;
     heap_flags_ = HeapFlags;
 
+    if (desc_.Alignment) {
+      if (desc_.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+        return E_INVALIDARG;
+    } else {
+      desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    }
+
+    if (pHeap) {
+      auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
+      if (size_and_align.size + Offset > pHeap->GetDesc().SizeInBytes)
+        return E_INVALIDARG;
+    }
+
     buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
 
     Flags<BufferAllocationFlag> flags;
-    buffer->rename(buffer->allocate(flags));
+    if (pHeap)
+      buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
+    else
+      buffer->rename(buffer->allocate(flags));
     device_->RegisterResidencyAndVA(buffer->current());
 
     return S_OK;
@@ -85,8 +101,6 @@ public:
       return E_INVALIDARG;
     if (heap_props_.Type == D3D12_HEAP_TYPE_DEFAULT)
       return E_INVALIDARG;
-    if (pReadRange && pReadRange->Begin != 0)
-      IMPLEMENT_ME
     if (ppData)
       *ppData = buffer->current()->mappedMemory(0);
     return S_OK;
@@ -249,7 +263,7 @@ CreateCommittedBuffer(
     REFIID riid, void **ppResource
 ) {
   auto buffer = Com(new MTLD3D12Buffer(pDevice));
-  HRESULT hr = buffer->Initialize(pHeapProps, HeapFlags, pDesc, OptimizedClearValue, nullptr);
+  HRESULT hr = buffer->Initialize(pHeapProps, HeapFlags, pDesc, OptimizedClearValue, nullptr, 0);
   if (FAILED(hr))
     return hr;
   if (!ppResource)
@@ -259,12 +273,16 @@ CreateCommittedBuffer(
 
 HRESULT
 CreatePlacedBuffer(
-    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
-    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
+    MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 Offset, const D3D12_RESOURCE_DESC *pDesc,
+    D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 ) {
   auto buffer = Com(new MTLD3D12Buffer(pDevice));
   D3D12_HEAP_DESC heap_desc = pHeap->GetDesc();
-  HRESULT hr = buffer->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, OptimizedClearValue, pHeap);
+
+  if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS)
+    return E_INVALIDARG;
+
+  HRESULT hr = buffer->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, OptimizedClearValue, pHeap, Offset);
   if (FAILED(hr))
     return hr;
   if (!ppResource)

@@ -890,6 +890,7 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandCopyFromBufferToTextureWithBlitOption,
   WMTBlitCommandCopyFromTextureToBufferWithBlitOption,
   WMTBlitCommandResetCommandsInBuffer,
+  WMTBlitCommandCopyTexture,
 };
 
 enum WMTBlitOption : uint16_t {
@@ -1043,6 +1044,14 @@ struct wmtcmd_blit_resetcommands {
   uint32_t length;
 };
 
+struct wmtcmd_blit_copy_texture {
+  enum WMTBlitCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t src;
+  obj_handle_t dst;
+};
+
 WINEMETAL_API void MTLBlitCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 enum WMTComputeCommandType : uint16_t {
@@ -1187,6 +1196,9 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetViewports,
   WMTRenderCommandSetScissorRects,
   WMTRenderCommandSetPSO,
+  /**
+  \deprecated use \ref WMTRenderCommandSetDepthStencilState
+  */
   WMTRenderCommandSetDSSO,
   WMTRenderCommandSetBlendFactorAndStencilRef,
   WMTRenderCommandSetVisibilityMode,
@@ -1216,6 +1228,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandExecuteCommandsInBuffer,
   WMTRenderCommandSetBlendFactor,
   WMTRenderCommandSetStencilRef,
+  WMTRenderCommandSetDepthStencilState,
 };
 
 struct wmtcmd_render_nop {
@@ -1464,6 +1477,13 @@ struct wmtcmd_render_setdsso {
   struct WMTMemoryPointer next;
   obj_handle_t dsso;
   uint8_t stencil_ref;
+};
+
+struct wmtcmd_render_setdepthstencilstate {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t depth_stencil_state;
 };
 
 struct wmtcmd_render_setblendcolor {
@@ -2122,5 +2142,10 @@ WINEMETAL_API obj_handle_t MTLDevice_newIndirectCommandBuffer(
 
 WINEMETAL_API obj_handle_t
 MTLDevice_newLibraryWithSource(obj_handle_t device, const char *source, uint64_t length, obj_handle_t *err_out);
+
+WINEMETAL_API void MTLTexture_getBytes(
+    obj_handle_t texture, struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice,
+    struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
+);
 
 #endif

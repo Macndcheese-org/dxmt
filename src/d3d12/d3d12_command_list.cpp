@@ -32,6 +32,8 @@ enum class DirtyState {
   ComputeRootSignature,
   BlendFactor,
   StencilRef,
+  GraphicsPipelineState,
+  ComputePipelineState,
 };
 
 enum class DrawCallStatus {
@@ -106,9 +108,6 @@ to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primiti
   return true;
 }
 
-/* FIXME: it's not *public* */
-unsigned getPlanarCount(WMTPixelFormat format);
-
 // `Graphics`CommandList is a really confusing name
 class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList> {
 
@@ -155,13 +154,8 @@ public:
 
   ~MTLD3D12GraphicsCommandListImpl() {}
 
-  HRESULT
-  Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
-    auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
-
-    if (allocator_ != allocator)
-      allocator_ = allocator;
-
+  void
+  ResetState(ID3D12PipelineState *pInitialPipelineState) {
     pso_graphics_ = nullptr;
     pso_compute_ = nullptr;
     if (auto pso = static_cast<MTLD3D12PipelineState *>(pInitialPipelineState)) {
@@ -203,6 +197,16 @@ public:
     index_offset = 0;
 
     dirty_state_.clrAll();
+  }
+
+  HRESULT
+  Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
+    auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
+
+    if (allocator_ != allocator)
+      allocator_ = allocator;
+
+    ResetState(pInitialPipelineState);
 
     encoder_count = std::numeric_limits<size_t>::max();
     return allocator_->StartRecord(&entry);
@@ -217,7 +221,8 @@ public:
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-        riid == __uuidof(ID3D12CommandList) || riid == __uuidof(ID3D12GraphicsCommandList)) {
+        riid == __uuidof(ID3D12CommandList) || riid == __uuidof(ID3D12GraphicsCommandList) ||
+        riid == __uuidof(ID3D12GraphicsCommandList1) || riid == __uuidof(ID3D12GraphicsCommandList2)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -248,7 +253,11 @@ public:
     return Initialize(pAllocator, pInitialState);
   };
 
-  void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pPipelineState) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  ClearState(ID3D12PipelineState *pPipelineState) {
+    allocator_->InvalidateCurrentPass();
+    ResetState(pPipelineState);
+  };
 
   std::tuple<uint64_t, uint64_t>
   PopulateVertexBufferTable(uint32_t Count) {
@@ -278,19 +287,6 @@ public:
     }
 
     return {offset, stride};
-  }
-
-  void
-  EncodeVertexBuffers() {
-    auto [Offset, Stride] = PopulateVertexBufferTable(1);
-    if (!Stride)
-      return;
-
-    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
-    cmd.type = WMTRenderCommandSetVertexBuffer;
-    cmd.buffer = allocator_->gpu_heap_buffer_;
-    cmd.offset = Offset;
-    cmd.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
   }
 
   DrawCallStatus
@@ -337,14 +333,14 @@ public:
         if (dsv_planar_flags & 1) {
           auto &rt = render->depth;
           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
-          rt.depth_plane = 0;
+          rt.depth_plane = 0; // DSV cannot be 3D
           rt.load_action = WMTLoadActionLoad;
           rt.store_action = WMTStoreActionStore;
         }
         if (dsv_planar_flags & 2) {
           auto &rt = render->stencil;
           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
-          rt.depth_plane = AttachmentDesc.DepthPlane;
+          rt.depth_plane = 0; // DSV cannot be 3D
           rt.load_action = WMTLoadActionLoad;
           rt.store_action = WMTStoreActionStore;
         }
@@ -361,15 +357,48 @@ public:
         render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
       }
 
-      if (pso_graphics_) {
-        UpdateGraphicsPSO(pso_graphics_.ptr());
-      }
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+    }
+
+    if (!pso_graphics_)
+      return DrawCallStatus::Invalid;
+
+    if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
+      auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
+      cmd_setpso.type = WMTRenderCommandSetPSO;
+      cmd_setpso.pso = pso_graphics_->pso;
+
+      auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
+      cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
+      cmd_setdsso.depth_stencil_state = pso_graphics_->GetDepthStencilState(
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->dsv_planar_flags,
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->dsv_readonly_flags
+      );
+
+      auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+      cmd_setrs.type = WMTRenderCommandSetRasterizerState;
+      cmd_setrs.cull_mode = pso_graphics_->cull_mode;
+      cmd_setrs.depth_clip_mode = pso_graphics_->depth_clip_mode;
+      cmd_setrs.fill_mode = pso_graphics_->fill_mode;
+      cmd_setrs.depth_bias = pso_graphics_->depth_bias;
+      cmd_setrs.depth_bias_clamp = pso_graphics_->depth_bias_clamp;
+      cmd_setrs.scole_scale = pso_graphics_->scole_scale;
+      cmd_setrs.winding = pso_graphics_->winding;
+
+      dirty_state_.clr(DirtyState::GraphicsPipelineState);
     }
     if (dirty_state_.test(DirtyState::VertexBuffer)) {
-      EncodeVertexBuffers();
+      auto [Offset, Stride] = PopulateVertexBufferTable(1);
+      if (Stride) {
+        auto &cmd_vsvb = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_vsvb.type = WMTRenderCommandSetVertexBuffer;
+        cmd_vsvb.buffer = allocator_->gpu_heap_buffer_;
+        cmd_vsvb.offset = Offset;
+        cmd_vsvb.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
+      }
       dirty_state_.clr(DirtyState::VertexBuffer);
     }
 
@@ -534,12 +563,18 @@ public:
       compute->cmd_head.next.set(0);
       compute->cmd_tail = (wmtcmd_base *)&compute->cmd_head;
       dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::ComputeRootSignature);
-      if (pso_compute_) {
-        auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
-        cmd_setpso.type = WMTComputeCommandSetPSO;
-        cmd_setpso.pso = pso_compute_->pso;
-        cmd_setpso.threadgroup_size = pso_compute_->threadgroup_size;
-      }
+      dirty_state_.set(DirtyState::ComputePipelineState);
+    }
+
+    if (!pso_compute_)
+        return false;
+
+    if (dirty_state_.test(DirtyState::ComputePipelineState)) {
+      auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
+      cmd_setpso.type = WMTComputeCommandSetPSO;
+      cmd_setpso.pso = pso_compute_->pso;
+      cmd_setpso.threadgroup_size = pso_compute_->threadgroup_size;
+      dirty_state_.clr(DirtyState::ComputePipelineState);
     }
 
     if (dirty_state_.test(DirtyState::ComputeRootArguments) && !SkipResourceBinding) {
@@ -620,101 +655,190 @@ public:
     if (!PreBlit())
       return;
 
+    auto src_desc = pSrc->pResource->GetDesc();
+    auto dst_desc = pDst->pResource->GetDesc();
+    uint32_t src_level = 0, src_slice = 0, src_planar = 0;
+    uint32_t dst_level = 0, dst_slice = 0, dst_planar = 0;
+    D3D12_BOX src_box, full_src_box;
+
+    if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+      full_src_box = {
+          0, 0, 0,
+          pSrc->PlacedFootprint.Footprint.Width,
+          pSrc->PlacedFootprint.Footprint.Height,
+          pSrc->PlacedFootprint.Footprint.Depth
+      };
+    } else {
+      DecomposeSubresource(src_desc, pSrc->SubresourceIndex, &src_level, &src_slice, &src_planar);
+      full_src_box = GetResourceExtent(src_desc, src_level);
+    }
+    src_box = pSrcBox ? *pSrcBox : full_src_box;
+
+    // discard invalid & empty box
+    if (src_box.left >= src_box.right || src_box.front >= src_box.back || src_box.top >= src_box.bottom)
+      return;
+
     if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
       auto &dst = static_cast<MTLD3D12Resource *>(pDst->pResource)->texture;
       if (!dst)
         return;
 
-      auto dst_planar_count = getPlanarCount(dst->pixelFormat());
-      auto dst_subresource_index = pDst->SubresourceIndex / dst_planar_count;
-      auto dst_subresource_planar = pDst->SubresourceIndex % dst_planar_count;
+      DecomposeSubresource(dst_desc, pDst->SubresourceIndex, &dst_level, &dst_slice, &dst_planar);
+
+      MTL_DXGI_FORMAT_DESC dst_format;
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_desc.Format, dst_format))) {
+        WARN("CopyTextureRegion: unsupported format ", dst_desc.Format);
+        return;
+      }
+      auto dst_planar_count = dst_format.PlanarCount;
 
       if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->buffer;
         if (!src)
           return;
-        if (pSrcBox)
-          IMPLEMENT_ME
+
+        MTL_DXGI_FORMAT_DESC src_format;
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), pSrc->PlacedFootprint.Footprint.Format, src_format))) {
+          WARN("CopyTextureRegion: unsupported format ", pSrc->PlacedFootprint.Footprint.Format);
+          return;
+        }
+
+        auto block_width = src_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+        auto src_depth_pitch = dst->textureType() == WMTTextureType3D
+                                   ? (pSrc->PlacedFootprint.Footprint.Height / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch
+                                   : 0;
 
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
         cmd_cp.src = src->current()->buffer();
-        cmd_cp.src_offset = pSrc->PlacedFootprint.Offset;
+        cmd_cp.src_offset = pSrc->PlacedFootprint.Offset + (src_box.left / block_width) * src_format.BytesPerTexel +
+                            (src_box.top / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch + src_box.front * src_depth_pitch;
         cmd_cp.bytes_per_row = pSrc->PlacedFootprint.Footprint.RowPitch;
-        cmd_cp.bytes_per_image = dst->textureType() == WMTTextureType3D
-                                     ? pSrc->PlacedFootprint.Footprint.Height * pSrc->PlacedFootprint.Footprint.RowPitch
-                                     : 0;
-        cmd_cp.size = {
-            pSrc->PlacedFootprint.Footprint.Width, pSrc->PlacedFootprint.Footprint.Height,
-            pSrc->PlacedFootprint.Footprint.Depth
-        };
+        cmd_cp.bytes_per_image = src_depth_pitch;
+        cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
         cmd_cp.dst = dst->current()->texture();
-        cmd_cp.level = dst_subresource_index % dst->miplevelCount();
-        cmd_cp.slice = dst_subresource_index / dst->miplevelCount();
-        cmd_cp.options = (dst_planar_count > 1) ? (dst_subresource_planar ? WMTBlitOptionStencilFromDepthStencil
-                                                                          : WMTBlitOptionDepthFromDepthStencil)
-                                                : WMTBlitOptionNone;
+        cmd_cp.level = dst_level;
+        cmd_cp.slice = dst_slice;
+        cmd_cp.options = (dst_planar_count > 1)
+                             ? (dst_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
+                             : WMTBlitOptionNone;
         cmd_cp.origin = {DstX, DstY, DstZ};
       } else {
         auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
         if (!src)
           return;
-        auto src_planar_count = getPlanarCount(src->pixelFormat());
-        if (!pSrcBox)
-          IMPLEMENT_ME
+
+        MTL_DXGI_FORMAT_DESC src_format;
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_format))) {
+          WARN("CopyTextureRegion: unsupported format ", src_desc.Format);
+          return;
+        }
+        auto src_planar_count = src_format.PlanarCount;
 
         // copy between depth-stencil texture is tricky
-        if (dst_planar_count > 1 || src_planar_count > 1)
-          IMPLEMENT_ME
+        if (dst_planar_count > 1 || src_planar_count > 1) {
+          // in this path, one/both of dst/src would be depth-stencil texture
+
+          if (dst_planar_count > 1 && src_planar_count > 1 && dst_planar != src_planar) {
+            WARN("CopyTextureRegion: unmatched planar"); // just in case
+            return;
+          }
+
+          auto texel_size = (dst_planar == 1 || src_planar == 1) ? 1 : 4;
+          auto width = src_box.right - src_box.left;
+          auto height = src_box.bottom - src_box.top;
+          auto bytes_per_row = align(width * texel_size, 256);
+          auto bytes_per_image = bytes_per_row * height;
+
+          auto [temp_buffer, temp_buffer_offset] = allocator_->AllocateTempBuffer(bytes_per_image, 256);
+
+          auto &cmd_to_tmp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+          cmd_to_tmp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
+          cmd_to_tmp.src = src->current()->texture();
+          cmd_to_tmp.level = src_level;
+          cmd_to_tmp.slice = src_slice;
+          cmd_to_tmp.origin = {src_box.left, src_box.top, src_box.front};
+          cmd_to_tmp.size = {width, height, src_box.back - src_box.front};
+          cmd_to_tmp.dst = temp_buffer;
+          cmd_to_tmp.offset = temp_buffer_offset;
+          cmd_to_tmp.bytes_per_image = 0; // DSV cannot be 3D
+          cmd_to_tmp.bytes_per_row = bytes_per_row;
+          cmd_to_tmp.options = (src_planar_count > 1) ? (src_planar ? WMTBlitOptionStencilFromDepthStencil
+                                                                    : WMTBlitOptionDepthFromDepthStencil)
+                                                      : WMTBlitOptionNone;
+
+          auto &cmd_to_tex = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
+          cmd_to_tex.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
+          cmd_to_tex.src = temp_buffer;
+          cmd_to_tex.src_offset = temp_buffer_offset;
+          cmd_to_tex.bytes_per_image = 0; // DSV cannot be 3D
+          cmd_to_tex.bytes_per_row = bytes_per_row;
+          cmd_to_tex.dst = dst->current()->texture();
+          cmd_to_tex.level = dst_level;
+          cmd_to_tex.slice = dst_slice;
+          cmd_to_tex.origin = {DstX, DstY, DstZ};
+          cmd_to_tex.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
+          cmd_to_tex.options = (dst_planar_count > 1) ? (dst_planar ? WMTBlitOptionStencilFromDepthStencil
+                                                                    : WMTBlitOptionDepthFromDepthStencil)
+                                                      : WMTBlitOptionNone;
+          return;
+        }
 
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
         cmd_cp.type = WMTBlitCommandCopyFromTextureToTexture;
         cmd_cp.src = src->current()->texture();
-        cmd_cp.src_level = pSrc->SubresourceIndex % src->miplevelCount();
-        cmd_cp.src_slice = pSrc->SubresourceIndex / src->miplevelCount();
-        cmd_cp.src_origin = {pSrcBox->left, pSrcBox->top, pSrcBox->front};
-        cmd_cp.src_size = {
-            pSrcBox->right - pSrcBox->left, pSrcBox->bottom - pSrcBox->top, pSrcBox->back - pSrcBox->front
-        };
+        cmd_cp.src_level = src_level;
+        cmd_cp.src_slice = src_slice;
+        cmd_cp.src_origin = {src_box.left, src_box.top, src_box.front};
+        cmd_cp.src_size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
         cmd_cp.dst = dst->current()->texture();
-        cmd_cp.dst_level = pDst->SubresourceIndex % dst->miplevelCount();
-        cmd_cp.dst_slice = pDst->SubresourceIndex / dst->miplevelCount();
+        cmd_cp.dst_level = dst_level;
+        cmd_cp.dst_slice = dst_slice;
         cmd_cp.dst_origin = {DstX, DstY, DstZ};
       }
     } else if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
       auto &dst = static_cast<MTLD3D12Resource *>(pDst->pResource)->buffer;
       if (!dst)
         return;
-      if (pSrcBox)
-        IMPLEMENT_ME
+
+      MTL_DXGI_FORMAT_DESC dst_format;
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), pDst->PlacedFootprint.Footprint.Format, dst_format))) {
+        WARN("CopyTextureRegion: unsupported format ", pDst->PlacedFootprint.Footprint.Format);
+        return;
+      }
+
       if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
         auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
         if (!src)
           return;
 
-        auto src_planar_count = getPlanarCount(src->pixelFormat());
-        auto src_subresource_index = pSrc->SubresourceIndex / src_planar_count;
-        auto src_subresource_planar = pSrc->SubresourceIndex % src_planar_count;
+        MTL_DXGI_FORMAT_DESC src_format;
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_format))) {
+          WARN("CopyTextureRegion: unsupported format ", src_desc.Format);
+          return;
+        }
+        auto src_planar_count = src_format.PlanarCount;
+
+        auto block_width = dst_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+        auto dst_depth_pitch = src->textureType() == WMTTextureType3D
+                                   ? (pDst->PlacedFootprint.Footprint.Height / block_width) * pDst->PlacedFootprint.Footprint.RowPitch
+                                   : 0;
 
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
         cmd_cp.src = src->current()->texture();
-        cmd_cp.level = src_subresource_index % src->miplevelCount();
-        cmd_cp.slice = src_subresource_index / src->miplevelCount();
-        cmd_cp.origin = {0, 0, 0};
-        cmd_cp.size = {
-            pDst->PlacedFootprint.Footprint.Width, pDst->PlacedFootprint.Footprint.Height,
-            pDst->PlacedFootprint.Footprint.Depth
-        };
+        cmd_cp.level = src_level;
+        cmd_cp.slice = src_slice;
+        cmd_cp.origin = {src_box.left, src_box.top, src_box.front};
+        cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
         cmd_cp.dst = dst->current()->buffer();
-        cmd_cp.offset = pDst->PlacedFootprint.Offset;
+        cmd_cp.offset = pDst->PlacedFootprint.Offset + (DstX / block_width) * dst_format.BytesPerTexel +
+                        (DstY / block_width) * pDst->PlacedFootprint.Footprint.RowPitch + DstZ * dst_depth_pitch;
         cmd_cp.bytes_per_row = pDst->PlacedFootprint.Footprint.RowPitch;
-        cmd_cp.bytes_per_image = src->textureType() == WMTTextureType3D
-                                     ? pDst->PlacedFootprint.Footprint.Height * pDst->PlacedFootprint.Footprint.RowPitch
-                                     : 0;
-        cmd_cp.options = (src_planar_count > 1) ? (src_subresource_planar ? WMTBlitOptionStencilFromDepthStencil
-                                                                          : WMTBlitOptionDepthFromDepthStencil)
-                                                : WMTBlitOptionNone;
+        cmd_cp.bytes_per_image = dst_depth_pitch;
+        cmd_cp.options = (src_planar_count > 1)
+                             ? (src_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
+                             : WMTBlitOptionNone;
       } else {
         // so it is buffer to buffer copy?
         IMPLEMENT_ME
@@ -748,7 +872,16 @@ public:
       return;
     }
 
-    IMPLEMENT_ME
+    // TODO: handle reinterpret copy
+    if (pDst->texture->pixelFormat() != pSrc->texture->pixelFormat()) {
+      WARN("CopyResource: TODO: reinterpret copy");
+      return;
+    }
+
+    auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_texture>();
+    cmd_cp.type = WMTBlitCommandCopyTexture;
+    cmd_cp.src = pSrc->texture->current()->texture();
+    cmd_cp.dst = pDst->texture->current()->texture();
   };
 
   void STDMETHODCALLTYPE CopyTiles(
@@ -853,37 +986,18 @@ public:
 
   void STDMETHODCALLTYPE
   OMSetStencilRef(UINT StencilRef) {
-    stencil_ref_ = StencilRef;
+    if (stencil_ref_ == (UINT8)StencilRef)
+      return;
+    stencil_ref_ = (UINT8)StencilRef;
     dirty_state_.set(DirtyState::StencilRef);
   };
-
-  void
-  UpdateGraphicsPSO(MTLD3D12GraphicsPipelineState *pso_graphics) {
-    auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
-    cmd_setpso.type = WMTRenderCommandSetPSO;
-    cmd_setpso.pso = pso_graphics->pso;
-
-    auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdsso>();
-    cmd_setdsso.type = WMTRenderCommandSetDSSO;
-    cmd_setdsso.dsso = pso_graphics->dsso;
-    cmd_setdsso.stencil_ref = 0; /* FIXME */
-
-    auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
-    cmd_setrs.type = WMTRenderCommandSetRasterizerState;
-    cmd_setrs.cull_mode = pso_graphics->cull_mode;
-    cmd_setrs.depth_clip_mode = pso_graphics->depth_clip_mode;
-    cmd_setrs.fill_mode = pso_graphics->fill_mode;
-    cmd_setrs.depth_bias = pso_graphics->depth_bias;
-    cmd_setrs.depth_bias_clamp = pso_graphics->depth_bias_clamp;
-    cmd_setrs.scole_scale = pso_graphics->scole_scale;
-    cmd_setrs.winding = pso_graphics->winding;
-  }
 
   void STDMETHODCALLTYPE
   SetPipelineState(ID3D12PipelineState *pPSO) {
     if (!pPSO) {
       pso_graphics_ = nullptr;
       pso_compute_ = nullptr;
+      dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState);
       return;
     }
 
@@ -894,12 +1008,7 @@ public:
         return;
       pso_compute_ = compute_pso;
       pso_graphics_ = nullptr;
-      if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
-        return;
-      auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
-      cmd_setpso.type = WMTComputeCommandSetPSO;
-      cmd_setpso.pso = pso_compute_->pso;
-      cmd_setpso.threadgroup_size = pso_compute_->threadgroup_size;
+      dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState);
       return;
     }
 
@@ -908,11 +1017,7 @@ public:
       return;
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;
-    if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render)
-      return;
-
-    UpdateGraphicsPSO(graphics_pso);
-    dirty_state_.set(DirtyState::VertexBuffer);
+    dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState, DirtyState::VertexBuffer);
   };
 
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
@@ -1079,9 +1184,10 @@ public:
 
   void STDMETHODCALLTYPE
   IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *pView) {
-    if (pView) {
+    auto index_buffer_allocation = pView ? device_->LookupBufferByVA(pView->BufferLocation, &index_offset) : nullptr;
+    if (index_buffer_allocation) {
       index_buffer_address = pView->BufferLocation;
-      index_buffer = device_->LookupBufferByVA(pView->BufferLocation, &index_offset)->buffer();
+      index_buffer = index_buffer_allocation->buffer();
       index_type = pView->Format == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
     } else {
       index_buffer_address = 0;
@@ -1127,25 +1233,38 @@ public:
       D3D12_CPU_DESCRIPTOR_HANDLE DSV, D3D12_CLEAR_FLAGS Flags, FLOAT Depth, UINT8 Stencil, UINT RectCount,
       const D3D12_RECT *Rects
   ) {
-    if (Rects || RectCount > 1) {
-      ERR("ClearDepthStencilView: unhandled parameter Rects=", Rects, " RectCount=", RectCount);
-      return;
-    }
-    if ((Flags & 3) == 0)
-      return;
     auto [Heap, Index] = GetRenderTargetHeap(device_, DSV);
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
     if (!AttachmentDesc.Texture)
       return;
+    auto CheckedFlags = Flags & DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
+    if (!CheckedFlags)
+      return;
+    if (Rects) {
+      allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
+      for (unsigned i = 0; i < RectCount; i++) {
+        auto rect = Rects[i];
+        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
+        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
+        int32_t rect_width = rect.right - rect_offset_x;
+        int32_t rect_height = rect.bottom - rect_offset_y;
+        if (rect_height <= 0 || rect_width <= 0)
+          continue;
+        allocator_->clear_rtv_.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, Depth, Stencil);
+      }
+      allocator_->clear_rtv_.end();
+      return;
+    }
     allocator_->InvalidateCurrentPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
-    encoder_info->clear_dsv = Flags & 3;
+    encoder_info->clear_dsv = CheckedFlags;
     encoder_info->depth_stencil = {Depth, Stencil};
     encoder_info->attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
     encoder_info->array_length = AttachmentDesc.RenderTargetArrayLength;
     encoder_info->width = AttachmentDesc.Width;
     encoder_info->height = AttachmentDesc.Height;
+    encoder_info->depth_plane = 0;
 
     allocator_->InvalidateCurrentPass();
   };
@@ -1154,14 +1273,28 @@ public:
   ClearRenderTargetView(
       D3D12_CPU_DESCRIPTOR_HANDLE RTV, const FLOAT Color[4], UINT RectCount, const D3D12_RECT *Rects
   ) {
-    if (Rects || RectCount > 1) {
-      ERR("ClearRenderTargetView: unhandled parameter Rects=", Rects, " RectCount=", RectCount);
-      return;
-    }
     auto [Heap, Index] = GetRenderTargetHeap(device_, RTV);
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
     if (!AttachmentDesc.Texture)
       return;
+    if (Rects) {
+      allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
+      for (unsigned i = 0; i < RectCount; i++) {
+        auto rect = Rects[i];
+        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
+        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
+        int32_t rect_width = rect.right - rect_offset_x;
+        int32_t rect_height = rect.bottom - rect_offset_y;
+        if (rect_height <= 0 || rect_width <= 0)
+          continue;
+        allocator_->clear_rtv_.clear(
+            rect_offset_x, rect_offset_y, rect_width, rect_height, AttachmentDesc.RenderTargetArrayLength,
+            {Color[0], Color[1], Color[2], Color[3]}
+        );
+      }
+      allocator_->clear_rtv_.end();
+      return;
+    }
     allocator_->InvalidateCurrentPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
@@ -1172,6 +1305,7 @@ public:
     encoder_info->array_length = AttachmentDesc.RenderTargetArrayLength;
     encoder_info->width = AttachmentDesc.Width;
     encoder_info->height = AttachmentDesc.Height;
+    encoder_info->depth_plane = AttachmentDesc.DepthPlane;
 
     allocator_->InvalidateCurrentPass();
   };
@@ -1378,6 +1512,52 @@ public:
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
   };
+
+  void STDMETHODCALLTYPE
+  AtomicCopyBufferUINT(
+      ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT Dependencies,
+      ID3D12Resource *const *ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64 *pDependentSubresourceRanges
+  ) {
+    IMPLEMENT_ME
+  }
+
+  void STDMETHODCALLTYPE
+  AtomicCopyBufferUINT64(
+      ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT Dependencies,
+      ID3D12Resource *const *ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64 *pDependentSubresourceRanges
+  ) {
+    IMPLEMENT_ME
+  }
+
+  void STDMETHODCALLTYPE
+  OMSetDepthBounds(FLOAT Min, FLOAT Max) {
+    WARN("OMSetDepthBounds: ignoring (", Min, ", ", Max, ")");
+  }
+
+  void STDMETHODCALLTYPE
+  SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION *pSamplePositions) {
+    IMPLEMENT_ME
+  }
+
+  void STDMETHODCALLTYPE
+  ResolveSubresourceRegion(
+      ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
+      UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode
+  ) {
+    IMPLEMENT_ME
+  }
+
+  void STDMETHODCALLTYPE
+  SetViewInstanceMask(UINT Mask) {
+    IMPLEMENT_ME
+  }
+
+  void STDMETHODCALLTYPE
+  WriteBufferImmediate(
+      UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE *pModes
+  ) {
+    IMPLEMENT_ME
+  }
 };
 
 HRESULT STDMETHODCALLTYPE
