@@ -226,6 +226,7 @@ Converter::LoadOperand(const SrcOperandAttribute &SrcOp, mask_t Mask) {
   switch (SrcOp.attribute) {
   case InputAttribute::VertexId:
   case InputAttribute::InstanceId:
+  case InputAttribute::SampleIndex:
     assert(0 && "never reached: should be handled separately");
     break;
   case InputAttribute::ThreadId: {
@@ -2563,11 +2564,9 @@ Converter::LoadInterpolant(uint32_t Index) {
     return {};
 
   auto interpolant = res.interpolant_map[Index];
-  auto h = interpolant.interpolant(nullptr).build(ctx);
-  if (h.takeError())
-    return {};
+  auto h = ctx.function->getArg(interpolant.arg_index);
 
-  return llvm::Optional<InterpolantHandle>({h.get(), interpolant.perspective});
+  return llvm::Optional<InterpolantHandle>({h, interpolant.perspective});
 }
 
 void
@@ -2639,18 +2638,14 @@ Converter::operator()(const InstMaskedSumOfAbsDiff &msad) {
 
   StoreOperand(msad.dst, Result);
 }
-
 void
 Converter::operator()(const InstEmit &) {
-  if (res.call_emit().build(ctx).takeError()) {
-    // TODO
-  }
+  res.call_emit();
 }
+
 void
 Converter::operator()(const InstCut &) {
-  if (res.call_cut().build(ctx).takeError()) {
-    // TODO
-  }
+  res.call_cut();
 }
 
 llvm::Value *

@@ -241,9 +241,6 @@ MTLD3D12PipelineState::InitializeShader(
   if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength)))
     return hr;
 
-  if (Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL) != DXBC_BLOB_NOT_FOUND)
-    return E_NOTIMPL;
-
   SM50Error error;
   if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
     ERR("Failed to initialize shader: ", SM50GetErrorMessageString(error));
@@ -502,15 +499,15 @@ public:
       data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
       data_ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
       std::vector<SM50_IA_INPUT_ELEMENT> elements(pDesc->InputLayout.NumElements);
-      hr = ExtractMTLInputLayoutElements(
-          device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements,
-          elements.data(), &data_ia_layout.num_elements
-      );
+      if (FAILED(
+              hr = ExtractMTLInputLayoutElements(
+                  device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs,
+                  pDesc->InputLayout.NumElements, elements.data(), &data_ia_layout.num_elements
+              )
+          ))
+        return hr;
       elements.resize(data_ia_layout.num_elements);
       data_ia_layout.elements = elements.data();
-      if (FAILED(hr)) {
-        return hr;
-      }
       slot_mask = 0;
       for (auto &element : elements) {
         slot_mask |= (1 << element.slot);
@@ -534,7 +531,7 @@ public:
       if (SM50Compile(
               shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
           )) {
-        ERR("Failed to compile vs shader");
+        ERR("Failed to compile vs shader: ", SM50GetErrorMessageString(sm50_err));
         return E_FAIL;
       }
 
@@ -591,7 +588,7 @@ public:
       if (SM50Compile(
               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
           )) {
-        ERR("Failed to compile ps shader");
+        ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
         return E_FAIL;
       }
       SM50_COMPILED_BITCODE ps_bitcode_compiled;
