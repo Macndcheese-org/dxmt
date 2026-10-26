@@ -1,4 +1,5 @@
 #pragma once
+#include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
 
 namespace dxmt {
@@ -9,6 +10,8 @@ public:
   D3D11DXGISurface(ID3D11Resource *pResource);
 
   D3D11DXGISurface(ID3D11Resource *pParentResource, UINT Subresource);
+
+  ~D3D11DXGISurface();
 
   ULONG STDMETHODCALLTYPE AddRef();
 
@@ -39,9 +42,22 @@ public:
   HRESULT STDMETHODCALLTYPE GetResource(REFIID riid, void **ppParentResource, UINT *pSubresourceIndex);
 
 private:
+  bool CreateDIB(UINT width, UINT height);
+
+  HRESULT ReadBack(const D3D11_TEXTURE2D_DESC &desc);
+
   ID3D11Resource *resource_;
   UINT subresource_;
   bool surface_from_subresource_;
+
+  /* GetDC(): a device context on a system memory bitmap, which is filled from the texture and written back to it */
+  HDC mem_dc_ = nullptr;
+  HBITMAP bitmap_ = nullptr;
+  void *bits_ = nullptr;
+  UINT width_ = 0;
+  UINT height_ = 0;
+  bool dc_acquired_ = false;
+  Com<ID3D11Texture2D> staging_;
 };
 
 } // namespace dxmt
