@@ -154,8 +154,16 @@ public:
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
     InitReturnPtr(ppSwapChain);
 
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    if (!ppSwapChain || !pDesc || !pDevice)
+      return DXGI_ERROR_INVALID_CALL;
+
+    Com<IMTLSwapChainFactory> swapchain_factory;
+    if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&swapchain_factory)))) {
+      ERR("Unsupported device type");
+      return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    return swapchain_factory->CreateCompositionSwapChain(this, pDesc, ppSwapChain);
   }
 
   HRESULT STDMETHODCALLTYPE EnumAdapters(UINT Adapter,
