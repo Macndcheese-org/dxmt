@@ -15,6 +15,8 @@ A merge that conflicts is not pushed: an issue (label `upstream-sync`) lists the
 
 The issue closes itself once the branch is up to date.
 
+A fork starts with its issues disabled (Settings > General > Features > Issues). With them off, the sync job ends red with the same text in its summary, and a failed build leaves only the red run.
+
 ## Keeping a release
 
 Only the newest pre-release is kept: the next build deletes it. A normal release is never touched.
