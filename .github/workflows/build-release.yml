@@ -1,0 +1,269 @@
+name: Build and Release
+
+# Builds the DXMT DLLs MacNdCheese ships with scripts/build-all.sh: dxgi, d3d10core, d3d11, d3d12 and
+# winemetal from this tree, d3d9 and winemetal9 from d3d9-core/, for x86_64 and i386.
+#
+# A push to a branch builds and keeps the result as a run artifact.  A push to RELEASE_BRANCH also
+# publishes it as a pre-release named after the version the Metal HUD shows (DXMT_VERSION, which is
+# `git describe --always`, for example v0.80-353-g01e8a0e), with the DLLs in dxmt-<version>.tar.gz.
+# The next build replaces the pre-release, and promote-release.yml turns it into a normal release when
+# MacNdCheese Wine has a normal release (.github/mnc/prerelease.sh).
+#
+# The toolchain jobs are those of ci.yml and use the same cache keys, so a cache that CI Build made
+# on the default branch is used here too.
+
+on:
+  push:
+    branches: [mncDXMT]
+  pull_request:
+    branches: [mncDXMT]
+    paths:
+      - .github/workflows/build-release.yml
+      - .github/mnc/**
+      - scripts/build-all.sh
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  RELEASE_BRANCH: mncDXMT
+  # keep these the same as in ci.yml (the version job warns when they differ)
+  LLVM_VERSION: llvmorg-15.0.7
+  WINE_VERSION: v8.16-3shain
+  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: git fetch --no-recurse-submodules --force --tags https://github.com/3Shain/dxmt
+
+      - name: Version
+        id: version
+        run: |
+          # the command of vcs_tag in meson.build
+          echo "version=$(git describe --always)" >> "$GITHUB_OUTPUT"
+
+      - name: Check the toolchain versions against ci.yml
+        run: |
+          for key in LLVM_VERSION WINE_VERSION WINE_URL; do
+            there=$(sed -n "s/^  $key: //p" .github/workflows/ci.yml)
+            [ "$there" = "${!key}" ] || echo "::warning::$key is ${!key} here and $there in ci.yml"
+          done
+
+  setup-wine:
+    runs-on: macos-15
+    steps:
+      - name: Cache Wine
+        id: cache-wine
+        uses: actions/cache@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          restore-keys: |
+            wine-x86_64-${{ env.WINE_VERSION }}-
+          lookup-only: true
+          path: ./toolchains/wine
+
+      - name: Install Wine
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains
+          curl -SL ${{ env.WINE_URL }} > ./wine.tar.gz
+          mkdir -p ./toolchains/wine
+          tar -zvxf ./wine.tar.gz -C ./toolchains/wine
+          rm ./wine.tar.gz
+
+      - name: Save Cache
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+  setup-llvm-project:
+    runs-on: macos-15
+    steps:
+      - name: Cache LLVM Project
+        id: cache-llvm-project
+        uses: actions/cache@v5
+        with:
+          key: llvm-project-${{ env.LLVM_VERSION }}-macos
+          restore-keys: |
+            llvm-project-${{ env.LLVM_VERSION }}-
+          lookup-only: true
+          path: ./toolchains/llvm-project
+
+      - name: Clone LLVM Project
+        if: steps.cache-llvm-project.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.LLVM_VERSION }} https://github.com/llvm/llvm-project.git toolchains/llvm-project
+
+      - name: Save Cache
+        if: steps.cache-llvm-project.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: llvm-project-${{ env.LLVM_VERSION }}-macos
+          path: ./toolchains/llvm-project
+
+  setup-llvm-darwin:
+    runs-on: macos-15
+    needs: setup-llvm-project
+    steps:
+      - name: Cache LLVM Darwin Build
+        id: cache-llvm-darwin
+        uses: actions/cache@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          restore-keys: |
+            llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-
+          lookup-only: true
+          path: ./toolchains/llvm-darwin
+
+      - name: Restore LLVM Project
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-project-${{ env.LLVM_VERSION }}-macos
+          path: ./toolchains/llvm-project
+
+      - name: Build LLVM for Darwin (x86_64)
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains/llvm-darwin-build
+          cmake -B ./toolchains/llvm-darwin-build -S ./toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
+            -DLLVM_ENABLE_ASSERTIONS=On \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-D_LIBCPP_KEEP_TRANSITIVE_INCLUDES_LLVM23" \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_INCLUDE_BENCHMARKS=Off \
+            -DBUG_REPORT_URL="https://github.com/3Shain/dxmt" \
+            -DPACKAGE_VENDOR="DXMT" \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
+            -G Ninja
+          cmake --build ./toolchains/llvm-darwin-build
+          cmake --install ./toolchains/llvm-darwin-build
+
+      - name: Save Cache
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+  build:
+    runs-on: macos-15
+    needs: [version, setup-wine, setup-llvm-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      # git describe needs them to start from upstream's last tag, as `version` does
+      - name: Fetch upstream tags
+        run: git fetch --no-recurse-submodules --force --tags https://github.com/3Shain/dxmt
+
+      - name: Restore Wine Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+          fail-on-cache-miss: true
+
+      - name: Restore LLVM Darwin Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+          fail-on-cache-miss: true
+
+      - name: Install mingw-w64
+        uses: tecolicom/actions-use-homebrew-tools@v1
+        with:
+          tools: mingw-w64
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      - name: Build
+        run: DXMT_NATIVE_LLVM=toolchains/llvm-darwin scripts/build-all.sh toolchains/wine dist
+
+      # The Metal HUD prints DXMT_VERSION of the DLL, so every DLL has to carry the version of the tag
+      - name: Check the version in the DLLs
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          for dir in build.w64 build.w32 d3d9-core/build.w64 d3d9-core/build.w32; do
+            h=$(find "$dir" -name version.h | head -1)
+            [ -n "$h" ] || { echo "::error::no version.h in $dir"; exit 1; }
+            grep -qF "\"$VERSION\"" "$h" || { echo "::error::$h does not say $VERSION"; cat "$h"; exit 1; }
+          done
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p "combined/$VERSION"
+          cp -R dist/. "combined/$VERSION/"
+          tar -czf "dxmt-$VERSION.tar.gz" -C combined --exclude='*.a' "$VERSION"
+          ls -l "dxmt-$VERSION.tar.gz"
+          tar -tzf "dxmt-$VERSION.tar.gz"
+
+      - name: Keep the build
+        uses: actions/upload-artifact@v6
+        with:
+          name: dxmt-${{ needs.version.outputs.version }}
+          path: dxmt-${{ needs.version.outputs.version }}.tar.gz
+          retention-days: 14
+
+      - name: Publish the pre-release
+        if: ${{ github.event_name != 'pull_request' && github.ref_name == env.RELEASE_BRANCH }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/mnc/prerelease.sh publish "${{ needs.version.outputs.version }}" "dxmt-${{ needs.version.outputs.version }}.tar.gz"
+
+  on-failure:
+    needs: build
+    if: ${{ always() && needs.build.result == 'failure' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open build-failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TITLE="build: ${{ github.ref_name }} failed to build (${{ github.sha }})"
+          # gh issue create fails when a label does not exist; a fork starts with the default ones only
+          gh label create build-failure --repo "${{ github.repository }}" --color D73A4A --force
+          gh label create automated --repo "${{ github.repository }}" --color 6A737D --force
+          gh issue create --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --label "build-failure,automated" \
+            --body "Automated build for commit ${{ github.sha }} on ${{ github.ref_name }} failed.
+
+          Failing run: ${RUN_URL}"

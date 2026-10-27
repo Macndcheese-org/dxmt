@@ -17,7 +17,7 @@
 # this tree is used for d3d9.
 #
 # Usage:
-#   scripts/build-all.sh <wine-install-tree> [output-dir]
+#   [DXMT_NATIVE_LLVM=<llvm 15 install>] scripts/build-all.sh <wine-install-tree> [output-dir]
 #
 # <wine-install-tree> is a Wine install layout (or a symlink farm shaped like
 # one) providing:
@@ -46,6 +46,12 @@ MESON_COMMON=(
   -Dwine_build_path=
   --buildtype release
 )
+
+# LLVM 15 for airconv, when it is not at the default of the native_llvm_path option
+# (/usr/local/opt/llvm@15).  Absolute, because the two trees are configured from different directories.
+if [ -n "${DXMT_NATIVE_LLVM:-}" ]; then
+  MESON_COMMON+=(-Dnative_llvm_path="$(cd "$DXMT_NATIVE_LLVM" && pwd)")
+fi
 
 # d3d9 must NOT carry the "Wine builtin DLL" marker. MacNdCheese loads it as
 # NATIVE (the backend adds a "d3d9=n" override on Apple GPUs), and wine refuses
