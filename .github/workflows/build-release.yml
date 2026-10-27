@@ -208,8 +208,12 @@ jobs:
       - name: Install Meson
         run: pip3 install meson==1.10.0 --break-system-packages
 
+      # The 3Shain tree (src/airconv/darwin/meson.build) refuses an absolute LLVM path inside the source
+      # tree, and d3d9-core/ cannot use the relative one, so the LLVM goes outside the checkout.
       - name: Build
-        run: DXMT_NATIVE_LLVM=toolchains/llvm-darwin scripts/build-all.sh toolchains/wine dist
+        run: |
+          mv toolchains/llvm-darwin "$RUNNER_TEMP/llvm-darwin"
+          DXMT_NATIVE_LLVM="$RUNNER_TEMP/llvm-darwin" scripts/build-all.sh toolchains/wine dist
 
       # The Metal HUD prints DXMT_VERSION of the DLL, so every DLL has to carry the version of the tag
       - name: Check the version in the DLLs

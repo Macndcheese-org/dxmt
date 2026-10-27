@@ -2,7 +2,7 @@
 
 | File | What it does |
 | --- | --- |
-| `workflows/build-release.yml` | Builds the DLLs with `scripts/build-all.sh` (d3d9 included) on every push to `mncDXMT`, and publishes them as a pre-release named after the Metal HUD version (`git describe --always`, for example `v0.80-353-g01e8a0e`). Only on `mncDXMT`. |
+| `workflows/build-release.yml` | Only on `mncDXMT`, which is where `scripts/build-all.sh` lives: builds the DLLs (d3d9 included) on every push and publishes them as a pre-release named after the Metal HUD version (`git describe --always`). |
 | `workflows/promote-release.yml` | Every hour: if `Macndcheese-org/wine` has a normal release that no DXMT release has been paired with, the DXMT pre-release becomes a normal release. |
 | `workflows/sync-upstream.yml` | Every three hours: merges `3Shain/dxmt` `main` into `main` and `mncDXMT` when they are behind, and pushes (never forced). Starts the build after a push to `mncDXMT`. |
 | `mnc/prerelease.sh`, `mnc/sync-upstream.sh` | The logic of the three workflows; both read their own header. |
