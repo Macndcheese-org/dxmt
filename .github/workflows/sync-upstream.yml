@@ -1,0 +1,52 @@
+name: Sync with upstream
+
+# Keeps main and mncDXMT up to date with 3Shain/dxmt: when a branch is behind upstream, upstream/main is
+# merged into it and the branch is pushed (never forced).  A merge that conflicts is not pushed: an issue
+# says which files conflict.  See .github/mnc/README.md and .github/mnc/sync-upstream.sh.
+#
+# A schedule only runs from the default branch, so this file must be on main.
+
+on:
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [main, mncDXMT]
+    steps:
+      # the scripts always come from the branch that holds this workflow, whatever branch is synced
+      - name: Checkout the scripts
+        uses: actions/checkout@v4
+        with:
+          path: tools
+          sparse-checkout: .github/mnc
+
+      # SYNC_TOKEN (optional secret) lets the merge change .github/workflows and makes the push start the
+      # push workflows; without it the GITHUB_TOKEN is used.
+      - name: Checkout ${{ matrix.branch }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          path: repo
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ../tools/.github/mnc/sync-upstream.sh "${{ matrix.branch }}"
