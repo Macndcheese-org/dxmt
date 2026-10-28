@@ -15,6 +15,7 @@
 #include "d3d11_device.hpp"
 #include "util_cpu_fence.hpp"
 #include "util_env.hpp"
+#include <mutex>
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include "util_hotpatch.h"
@@ -123,6 +124,94 @@ public:
   };
 };
 
+/* The windows of composition swap chains belong to a thread of their own that runs a message loop. The compositor
+ * posts to these windows from its own thread, and a window of a thread that does not process messages would never
+ * see them. Changing the style or the parent of a window of another thread is a message sent to it, which must not
+ * wait for a thread that is busy rendering. */
+static LRESULT CALLBACK CompositionWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+class CompositionWindowThread {
+public:
+  static CompositionWindowThread &Get() {
+    static CompositionWindowThread instance;
+    return instance;
+  }
+
+  HWND CreatePlacedWindow(UINT width, UINT height) {
+    if (!Start())
+      return nullptr;
+    Request request = {width, height, nullptr, CreateEventA(nullptr, FALSE, FALSE, nullptr)};
+    if (!request.done || !PostThreadMessageA(thread_id_, kCreateMessage, 0, reinterpret_cast<LPARAM>(&request))) {
+      if (request.done)
+        CloseHandle(request.done);
+      return nullptr;
+    }
+    WaitForSingleObject(request.done, INFINITE);
+    CloseHandle(request.done);
+    return request.result;
+  }
+
+  void DestroyPlacedWindow(HWND hWnd) { PostMessageA(hWnd, kDestroyMessage, 0, 0); }
+
+  static constexpr UINT kCreateMessage = WM_APP + 0x4d1;
+  static constexpr UINT kDestroyMessage = WM_APP + 0x4d2;
+
+private:
+  struct Request {
+    UINT width, height;
+    HWND result;
+    HANDLE done;
+  };
+
+  bool Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (thread_id_)
+      return true;
+    HANDLE ready = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!ready)
+      return false;
+    HANDLE thread = CreateThread(nullptr, 0, Run, ready, 0, reinterpret_cast<LPDWORD>(&thread_id_));
+    if (!thread) {
+      CloseHandle(ready);
+      thread_id_ = 0;
+      return false;
+    }
+    CloseHandle(thread);
+    WaitForSingleObject(ready, INFINITE);
+    CloseHandle(ready);
+    return true;
+  }
+
+  static DWORD WINAPI Run(LPVOID param) {
+    static const char class_name[] = "DXMTCompositionSwapChainWindow";
+    MSG msg;
+    WNDCLASSEXA wc = {sizeof(wc)};
+    wc.lpfnWndProc = CompositionWindowProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = class_name;
+    PeekMessageA(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE); /* creates the message queue */
+    RegisterClassExA(&wc);
+    SetEvent(static_cast<HANDLE>(param));
+    while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
+      if (!msg.hwnd && msg.message == kCreateMessage) {
+        auto *request = reinterpret_cast<Request *>(msg.lParam);
+        request->result = CreateWindowExA(
+            WS_EX_NOACTIVATE, class_name, nullptr, WS_POPUP, 0, 0, std::max<UINT>(request->width, 1),
+            std::max<UINT>(request->height, 1), nullptr, nullptr, wc.hInstance, nullptr
+        );
+        SetEvent(request->done);
+        continue;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageA(&msg);
+    }
+    return 0;
+  }
+
+  std::mutex mutex_;
+  DWORD thread_id_ = 0;
+};
+
 template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
 public:
@@ -226,7 +315,7 @@ public:
     native_view_ = {};
     CloseHandle(present_semaphore_);
     if (composition_)
-      DestroyWindow(hWnd);
+      CompositionWindowThread::Get().DestroyPlacedWindow(hWnd);
   };
 
   /* Acquire the window's Metal layer and stand up the Presenter, once, on the
@@ -1272,6 +1361,60 @@ CreateSwapChain(
   return S_OK;
 };
 
+/* The window of a composition swap chain can be put into the window a visual is shown in (see EnsurePresentTarget).
+ * The compositor asks for it with a message that this window processes in the thread that owns it, so that a
+ * thread that waits for the compositor never has to wait for the window of the swap chain. */
+static const GUID kMNCCompositionWindow = {0x6d6e6300, 0x6469, 0x636f, {0x6d, 0x70, 0x77, 0x69, 0x6e, 0x64, 0x6f, 0x77}};
+
+struct CompositionPlacement {
+  HWND parent;
+  HWND insert_after;
+  int x, y, width, height;
+  BOOL visible;
+  BOOL has_clip;
+  RECT clip; /* in the coordinates of the window */
+};
+
+static UINT CompositionPlaceMessage() {
+  static UINT message = RegisterWindowMessageA("MNC_DXMT_COMPOSITION_PLACE");
+  return message;
+}
+
+static LRESULT CALLBACK CompositionWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  if (msg == CompositionWindowThread::kDestroyMessage) {
+    DestroyWindow(hWnd);
+    return 0;
+  }
+  if (msg == WM_NCHITTEST)
+    return HTTRANSPARENT;
+  if (msg == WM_MOUSEACTIVATE)
+    return MA_NOACTIVATE;
+  if (msg == CompositionPlaceMessage() && lParam) {
+    auto *placement = reinterpret_cast<CompositionPlacement *>(lParam);
+    if (placement->visible) {
+      if (GetParent(hWnd) != placement->parent) {
+        SetWindowLongA(hWnd, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS);
+        SetParent(hWnd, placement->parent);
+      }
+      if (placement->has_clip) {
+        HRGN region = CreateRectRgn(placement->clip.left, placement->clip.top, placement->clip.right, placement->clip.bottom);
+        SetWindowRgn(hWnd, region, FALSE);
+      } else {
+        SetWindowRgn(hWnd, nullptr, FALSE);
+      }
+      SetWindowPos(
+          hWnd, placement->insert_after, placement->x, placement->y, placement->width, placement->height,
+          SWP_NOACTIVATE | SWP_SHOWWINDOW
+      );
+    } else {
+      SetWindowPos(hWnd, nullptr, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_HIDEWINDOW);
+    }
+    delete placement;
+    return 0;
+  }
+  return DefWindowProcA(hWnd, msg, wParam, lParam);
+}
+
 HRESULT
 CreateCompositionSwapChain(
     IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGISwapChain1 **ppSwapChain
@@ -1282,27 +1425,16 @@ CreateCompositionSwapChain(
 
   /* The swap chain is not tied to a window, but it needs the size and monitor of one. The window is hidden, is never
    * presented to and belongs to the swap chain, which destroys it. */
-  static const char class_name[] = "DXMTCompositionSwapChainWindow";
-  WNDCLASSEXA wc = {sizeof(wc)};
-  wc.lpfnWndProc = DefWindowProcA;
-  wc.hInstance = GetModuleHandleA(nullptr);
-  wc.lpszClassName = class_name;
-  if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-    return E_FAIL;
-
-  HWND hWnd = CreateWindowExA(
-      0, class_name, nullptr, WS_POPUP, 0, 0, std::max<UINT>(pDesc->Width, 1), std::max<UINT>(pDesc->Height, 1), nullptr,
-      nullptr, wc.hInstance, nullptr
-  );
+  HWND hWnd = CompositionWindowThread::Get().CreatePlacedWindow(pDesc->Width, pDesc->Height);
   if (!hWnd)
     return E_FAIL;
-  if (env::getEnvVar("DXMT_COMPOSITION_WINDOW_VISIBLE") == "1")
-    SetWindowPos(hWnd, HWND_TOPMOST, 100, 100, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
   DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
   HRESULT hr = CreateSwapChain(pFactory, pDevice, hWnd, &desc, nullptr, ppSwapChain, true);
   if (FAILED(hr))
-    DestroyWindow(hWnd);
+    CompositionWindowThread::Get().DestroyPlacedWindow(hWnd);
+  else
+    (*ppSwapChain)->SetPrivateData(kMNCCompositionWindow, sizeof(hWnd), &hWnd);
   return hr;
 }
 
