@@ -294,7 +294,16 @@ public:
     if (!pUsage) {
       return E_INVALIDARG;
     }
-    *pUsage = 0;
+    /* IDXGIResource::GetUsage tells what the resource can be used for: it follows from the bind flags. Code that
+     * shares the resource, such as ANGLE, relies on it to know whether the texture can be sampled or rendered to. */
+    DXGI_USAGE usage = 0;
+    if (this->bind_flags_ & D3D11_BIND_SHADER_RESOURCE)
+      usage |= DXGI_USAGE_SHADER_INPUT;
+    if (this->bind_flags_ & D3D11_BIND_RENDER_TARGET)
+      usage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    if (this->bind_flags_ & D3D11_BIND_UNORDERED_ACCESS)
+      usage |= DXGI_USAGE_UNORDERED_ACCESS;
+    *pUsage = usage;
     return S_OK;
   }
 

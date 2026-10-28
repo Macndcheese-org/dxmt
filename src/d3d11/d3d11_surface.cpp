@@ -18,6 +18,8 @@
 #include "d3d11_surface.hpp"
 #include "com/com_object.hpp"
 #include "d3d11_resource.hpp"
+#include <algorithm>
+#include <cstring>
 
 namespace dxmt {
 
@@ -222,16 +224,144 @@ D3D11DXGISurface::Unmap() {
   return S_OK;
 }
 
+D3D11DXGISurface::~D3D11DXGISurface() {
+  if (mem_dc_)
+    DeleteDC(mem_dc_);
+  if (bitmap_)
+    DeleteObject(bitmap_);
+}
+
+bool
+D3D11DXGISurface::CreateDIB(UINT width, UINT height) {
+  if (mem_dc_)
+    DeleteDC(mem_dc_);
+  if (bitmap_)
+    DeleteObject(bitmap_);
+  mem_dc_ = nullptr;
+  bitmap_ = nullptr;
+  bits_ = nullptr;
+  staging_ = nullptr;
+
+  BITMAPINFO info = {};
+  info.bmiHeader.biSize = sizeof(info.bmiHeader);
+  info.bmiHeader.biWidth = width;
+  info.bmiHeader.biHeight = -(LONG)height; // top-down, like the texture
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+
+  mem_dc_ = CreateCompatibleDC(nullptr);
+  if (!mem_dc_)
+    return false;
+  bitmap_ = CreateDIBSection(mem_dc_, &info, DIB_RGB_COLORS, &bits_, nullptr, 0);
+  if (!bitmap_) {
+    DeleteDC(mem_dc_);
+    mem_dc_ = nullptr;
+    return false;
+  }
+  SelectObject(mem_dc_, bitmap_);
+  width_ = width;
+  height_ = height;
+  return true;
+}
+
+HRESULT
+D3D11DXGISurface::ReadBack(const D3D11_TEXTURE2D_DESC &desc) {
+  Com<ID3D11Device> device;
+  Com<ID3D11DeviceContext> context;
+
+  resource_->GetDevice(&device);
+  device->GetImmediateContext(&context);
+
+  if (!staging_) {
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.MipLevels = 1;
+    staging_desc.ArraySize = 1;
+    staging_desc.SampleDesc = {1, 0};
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+    HRESULT hr = device->CreateTexture2D(&staging_desc, nullptr, &staging_);
+    if (FAILED(hr))
+      return hr;
+  }
+
+  context->CopySubresourceRegion(staging_.ptr(), 0, 0, 0, 0, resource_, subresource_, nullptr);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  HRESULT hr = context->Map(staging_.ptr(), 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+    return hr;
+  for (UINT y = 0; y < height_; y++)
+    std::memcpy(
+        static_cast<char *>(bits_) + y * width_ * 4, static_cast<const char *>(mapped.pData) + y * mapped.RowPitch,
+        width_ * 4
+    );
+  context->Unmap(staging_.ptr(), 0);
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE
 D3D11DXGISurface::GetDC(BOOL Discard, HDC *phdc) {
-  // TODO(gdi-surface)
-  return DXGI_ERROR_INVALID_CALL;
+  if (!phdc)
+    return DXGI_ERROR_INVALID_CALL;
+  *phdc = nullptr;
+
+  Com<ID3D11Texture2D> texture;
+  if (FAILED(resource_->QueryInterface(IID_PPV_ARGS(&texture))))
+    return DXGI_ERROR_INVALID_CALL;
+
+  D3D11_TEXTURE2D_DESC desc;
+  texture->GetDesc(&desc);
+
+  /* GDI compatible surfaces are B8G8R8A8 */
+  if (!(desc.MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE) || dc_acquired_ ||
+      (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+    return DXGI_ERROR_INVALID_CALL;
+
+  if (!bitmap_ || width_ != desc.Width || height_ != desc.Height) {
+    if (!CreateDIB(desc.Width, desc.Height))
+      return E_FAIL;
+  }
+
+  if (!Discard) {
+    HRESULT hr = ReadBack(desc);
+    if (FAILED(hr))
+      return hr;
+  }
+
+  dc_acquired_ = true;
+  *phdc = mem_dc_;
+  return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE
 D3D11DXGISurface::ReleaseDC(RECT *pDirtyRect) {
-  // TODO(gdi-surface)
-  return DXGI_ERROR_INVALID_CALL;
+  if (!dc_acquired_)
+    return DXGI_ERROR_INVALID_CALL;
+  dc_acquired_ = false;
+
+  RECT rect = {0, 0, (LONG)width_, (LONG)height_};
+  if (pDirtyRect) {
+    rect.left = std::max<LONG>(pDirtyRect->left, 0);
+    rect.top = std::max<LONG>(pDirtyRect->top, 0);
+    rect.right = std::min<LONG>(pDirtyRect->right, width_);
+    rect.bottom = std::min<LONG>(pDirtyRect->bottom, height_);
+    if (rect.left >= rect.right || rect.top >= rect.bottom)
+      return S_OK;
+  }
+
+  Com<ID3D11Device> device;
+  Com<ID3D11DeviceContext> context;
+  resource_->GetDevice(&device);
+  device->GetImmediateContext(&context);
+
+  D3D11_BOX box = {(UINT)rect.left, (UINT)rect.top, 0, (UINT)rect.right, (UINT)rect.bottom, 1};
+  const UINT pitch = width_ * 4;
+  context->UpdateSubresource(
+      resource_, subresource_, &box, static_cast<const char *>(bits_) + rect.top * pitch + rect.left * 4, pitch, 0
+  );
+  return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE

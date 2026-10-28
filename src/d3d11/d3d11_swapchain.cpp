@@ -15,6 +15,7 @@
 #include "d3d11_device.hpp"
 #include "util_cpu_fence.hpp"
 #include "util_env.hpp"
+#include <mutex>
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include "util_hotpatch.h"
@@ -123,13 +124,107 @@ public:
   };
 };
 
+/* The windows of composition swap chains belong to a thread of their own that runs a message loop. The compositor
+ * posts to these windows from its own thread, and a window of a thread that does not process messages would never
+ * see them. Changing the style or the parent of a window of another thread is a message sent to it, which must not
+ * wait for a thread that is busy rendering. */
+static LRESULT CALLBACK CompositionWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+class CompositionWindowThread {
+public:
+  static CompositionWindowThread &Get() {
+    static CompositionWindowThread instance;
+    return instance;
+  }
+
+  HWND CreatePlacedWindow(UINT width, UINT height) {
+    if (!Start())
+      return nullptr;
+    Request request = {width, height, nullptr, CreateEventA(nullptr, FALSE, FALSE, nullptr)};
+    if (!request.done || !PostThreadMessageA(thread_id_, kCreateMessage, 0, reinterpret_cast<LPARAM>(&request))) {
+      if (request.done)
+        CloseHandle(request.done);
+      return nullptr;
+    }
+    WaitForSingleObject(request.done, INFINITE);
+    CloseHandle(request.done);
+    return request.result;
+  }
+
+  void DestroyPlacedWindow(HWND hWnd) { PostMessageA(hWnd, kDestroyMessage, 0, 0); }
+
+  static constexpr UINT kCreateMessage = WM_APP + 0x4d1;
+  static constexpr UINT kDestroyMessage = WM_APP + 0x4d2;
+
+private:
+  struct Request {
+    UINT width, height;
+    HWND result;
+    HANDLE done;
+  };
+
+  bool Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (thread_id_)
+      return true;
+    HANDLE ready = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!ready)
+      return false;
+    HANDLE thread = CreateThread(nullptr, 0, Run, ready, 0, reinterpret_cast<LPDWORD>(&thread_id_));
+    if (!thread) {
+      CloseHandle(ready);
+      thread_id_ = 0;
+      return false;
+    }
+    CloseHandle(thread);
+    WaitForSingleObject(ready, INFINITE);
+    CloseHandle(ready);
+    return true;
+  }
+
+  static DWORD WINAPI Run(LPVOID param) {
+    static const char class_name[] = "DXMTCompositionSwapChainWindow";
+    MSG msg;
+    WNDCLASSEXA wc = {sizeof(wc)};
+    wc.lpfnWndProc = CompositionWindowProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = class_name;
+    PeekMessageA(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE); /* creates the message queue */
+    RegisterClassExA(&wc);
+    SetEvent(static_cast<HANDLE>(param));
+    while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
+      if (!msg.hwnd && msg.message == kCreateMessage) {
+        auto *request = reinterpret_cast<Request *>(msg.lParam);
+        /* A layered window with the transparent style is skipped when the window under the mouse is looked for, in
+         * every thread and process: the mouse goes to the window the visual is shown in, as it does on Windows. */
+        request->result = CreateWindowExA(
+            WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, class_name, nullptr, WS_POPUP, 0, 0,
+            std::max<UINT>(request->width, 1), std::max<UINT>(request->height, 1), nullptr, nullptr, wc.hInstance,
+            nullptr
+        );
+        if (request->result)
+          SetLayeredWindowAttributes(request->result, 0, 255, LWA_ALPHA);
+
+        SetEvent(request->done);
+        continue;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageA(&msg);
+    }
+    return 0;
+  }
+
+  std::mutex mutex_;
+  DWORD thread_id_ = 0;
+};
+
 template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
 public:
   MTLD3D11SwapChain(
       IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, IMTLDXGIDevice *pDXGIDevice,
        HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
-      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc
+      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, bool composition
   ) :
       MTLDXGISubObject(pDevice),
       factory_(pFactory),
@@ -138,6 +233,8 @@ public:
       desc_(*pDesc),
       device_context_(pDevice->GetImmediateContextPrivate()),
       hWnd(hWnd),
+      composition_(composition),
+      composition_present_(composition && env::getEnvVar("DXMT_COMPOSITION_PRESENT") != "0"),
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
@@ -146,6 +243,10 @@ public:
     }
 
     // The window's Metal layer is NOT acquired here: see EnsurePresentTarget().
+    if (composition_)
+      Logger::debug(str::format("DXGI: composition swap chain ", desc_.Width, "x", desc_.Height, " format=", desc_.Format,
+                               " buffers=", desc_.BufferCount, " effect=", desc_.SwapEffect, " usage=", desc_.BufferUsage,
+                               " alpha=", desc_.AlphaMode, " flags=", desc_.Flags));
 
     frame_latency = kSwapchainLatency;
     present_semaphore_ = CreateSemaphore(nullptr, frame_latency,
@@ -219,6 +320,8 @@ public:
     client_surface_ = {};
     native_view_ = {};
     CloseHandle(present_semaphore_);
+    if (composition_)
+      CompositionWindowThread::Get().DestroyPlacedWindow(hWnd);
   };
 
   /* Acquire the window's Metal layer and stand up the Presenter, once, on the
@@ -233,8 +336,34 @@ public:
    * window with the backbuffer's initial contents. Deferring the acquire leaves
    * a render-only chain's window alone; the first real Present binds it exactly
    * as before. */
+  /* The Metal layer of a window is tied to its toplevel window: a window that is moved under another one (a
+   * composition swap chain whose window the compositor puts into the window the visual is shown in) needs its layer
+   * acquired again. */
+  /* A composition swap chain presents to its window while the compositor shows that window in the window of a
+   * visual. Otherwise the compositor reads the back buffer. */
+  bool PresentsToWindow() { return composition_ && composition_present_ && IsWindowVisible(hWnd); }
+
+  void ReleasePresentTarget() {
+    device_context_->WaitUntilGPUIdle();
+    presenter = nullptr;
+    if (client_surface_ != nullptr) {
+      HDC hdc = GetDC(hWnd);
+      struct macdrv_escape_surface surfaceInfo = {0};
+      surfaceInfo.surface = client_surface_.handle;
+      ExtEscape(hdc, MACDRV_ESCAPE_RELEASE_SURFACE, sizeof(surfaceInfo), (LPCSTR)&surfaceInfo, 0, NULL);
+      ReleaseDC(hWnd, hdc);
+    } else if (native_view_ != nullptr) {
+      WMT::ReleaseMetalView(native_view_);
+    }
+    client_surface_ = {};
+    native_view_ = {};
+    layer_weak_ = {};
+    root_hwnd_ = nullptr;
+  }
+
   void EnsurePresentTarget() {
-    if (presenter != nullptr)
+    /* A composition swap chain is never put on a window: the compositor reads its back buffer. */
+    if ((composition_ && !PresentsToWindow()) || presenter != nullptr)
       return;
 
     HDC hdc = GetDC(hWnd);
@@ -260,6 +389,7 @@ public:
       abort();
     }
 
+    root_hwnd_ = GetAncestor(hWnd, GA_ROOT);
     Logger::info(str::format("DXGI: present target hwnd=", reinterpret_cast<uintptr_t>(hWnd),
                              " size=", desc_.Width, "x", desc_.Height));
 
@@ -317,8 +447,10 @@ public:
   GetBuffer(UINT buffer_idx, REFIID riid, void **surface) final {
     if (buffer_idx == 0) {
       return backbuffer_->QueryInterface(riid, surface);
+    } else if (buffer_idx <= extra_buffers_.size()) {
+      return extra_buffers_[buffer_idx - 1]->QueryInterface(riid, surface);
     } else {
-      ERR("Non zero-index buffer is not supported");
+      ERR("Non zero-index buffer is not supported: ", buffer_idx);
       return DXGI_ERROR_UNSUPPORTED;
     }
   };
@@ -577,6 +709,20 @@ public:
     backbuffer_->AddRefPrivate();
     backbuffer_->Release();
 
+    /* The buffers of a composition swap chain are all reachable and none is rotated in on Present: the application
+     * draws into buffer 0 and the compositor reads buffer 0, as with Wine's own DXGI. */
+    extra_buffers_.clear();
+    for (UINT i = 1; composition_ && i < desc_.BufferCount; i++) {
+      Com<D3D11ResourceCommon, false> buffer;
+      if (FAILED(dxmt::CreateDeviceTexture2D(
+              device_, &backbuffer_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer)
+          )))
+        return E_FAIL;
+      buffer->AddRefPrivate();
+      buffer->Release();
+      extra_buffers_.push_back(std::move(buffer));
+    }
+
     if constexpr (EnableMetalFX) {
       D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc_;
       upscaled_desc_.Height *= scale_factor;
@@ -753,6 +899,10 @@ public:
     if (pHwnd == NULL) {
       return E_POINTER;
     }
+    if (composition_) {
+      *pHwnd = nullptr;
+      return DXGI_ERROR_INVALID_CALL;
+    }
     *pHwnd = hWnd;
     return S_OK;
   };
@@ -807,6 +957,8 @@ public:
     // First Present is what binds this window's CAMetalLayer: a chain the app
     // only ever renders into never reaches here, so it never covers its window
     // (see EnsurePresentTarget). No-op once the target is up.
+    if (composition_present_ && presenter != nullptr && GetAncestor(hWnd, GA_ROOT) != root_hwnd_)
+      ReleasePresentTarget();
     EnsurePresentTarget();
 
     HRESULT hr = S_OK;
@@ -843,6 +995,17 @@ public:
     auto &cmd_queue = device_->GetDXMTDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
+    if (composition_ && !PresentsToWindow()) {
+      /* Nothing to show: the content is what the compositor reads from the back buffer. Only
+       * submit the work and let the frame-latency accounting run. */
+      chunk->emitcc([this, sync_state = SyncFrame(++presentation_count_)](ArgumentEncodingContext &) mutable {
+        ReleaseSemaphore(present_semaphore_, 1, nullptr);
+      });
+      device_context_->Commit();
+      lock.unlock();
+      cmd_queue.PresentBoundary();
+      return hr;
+    }
     if (target_) {
       auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
       presenter->changeGammaRamp(output->GetGammaRamp());
@@ -1140,9 +1303,19 @@ private:
   D3D11_TEXTURE2D_DESC1 backbuffer_desc_;
   IMTLD3D11DeviceContext* device_context_;
   Com<D3D11ResourceCommon, false> backbuffer_;
+  /* buffers 1 and up of a composition swap chain */
+  std::vector<Com<D3D11ResourceCommon, false>> extra_buffers_;
   HANDLE present_semaphore_;
   std::unique_ptr<CpuFence> frame_latency_fence_;
   HWND hWnd;
+  /* the swap chain was created by CreateSwapChainForComposition: hWnd is a hidden window of its own, kept only so the
+   * swap chain has the surface size and monitor of a window-bound one */
+  bool composition_;
+  /* A composition swap chain also presents its back buffer into the Metal layer of its own window, so that the
+   * window system can show the visual without the compositor reading the buffer back. DXMT_COMPOSITION_PRESENT=0
+   * leaves the buffer to the compositor. */
+  bool composition_present_;
+  HWND root_hwnd_ = nullptr;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
   wsi::DXMTWindowState window_state_;
@@ -1165,7 +1338,7 @@ private:
 HRESULT
 CreateSwapChain(
     IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
-    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain, bool composition
 ) {
   if (pDesc == NULL)
     return DXGI_ERROR_INVALID_CALL;
@@ -1186,7 +1359,7 @@ CreateSwapChain(
   if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
       *ppSwapChain = new MTLD3D11SwapChain<true>(
-          pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
+          pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc, composition
       );
       return S_OK;
     } else {
@@ -1194,9 +1367,86 @@ CreateSwapChain(
     }
   }
   *ppSwapChain = new MTLD3D11SwapChain<false>(
-      pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
+      pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc, composition
   );
   return S_OK;
 };
+
+/* The window of a composition swap chain can be put into the window a visual is shown in (see EnsurePresentTarget).
+ * The compositor asks for it with a message that this window processes in the thread that owns it, so that a
+ * thread that waits for the compositor never has to wait for the window of the swap chain. */
+static const GUID kMNCCompositionWindow = {0x6d6e6300, 0x6469, 0x636f, {0x6d, 0x70, 0x77, 0x69, 0x6e, 0x64, 0x6f, 0x77}};
+
+struct CompositionPlacement {
+  HWND parent;
+  HWND insert_after;
+  int x, y, width, height;
+  BOOL visible;
+  BOOL has_clip;
+  RECT clip; /* in the coordinates of the window */
+};
+
+static UINT CompositionPlaceMessage() {
+  static UINT message = RegisterWindowMessageA("MNC_DXMT_COMPOSITION_PLACE");
+  return message;
+}
+
+static LRESULT CALLBACK CompositionWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  if (msg == CompositionWindowThread::kDestroyMessage) {
+    DestroyWindow(hWnd);
+    return 0;
+  }
+  if (msg == WM_NCHITTEST)
+    return HTTRANSPARENT;
+  if (msg == WM_MOUSEACTIVATE)
+    return MA_NOACTIVATE;
+  if (msg == CompositionPlaceMessage() && lParam) {
+    auto *placement = reinterpret_cast<CompositionPlacement *>(lParam);
+    if (placement->visible) {
+      if (GetParent(hWnd) != placement->parent) {
+        SetWindowLongA(hWnd, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS);
+        SetParent(hWnd, placement->parent);
+      }
+      if (placement->has_clip) {
+        HRGN region = CreateRectRgn(placement->clip.left, placement->clip.top, placement->clip.right, placement->clip.bottom);
+        SetWindowRgn(hWnd, region, FALSE);
+      } else {
+        SetWindowRgn(hWnd, nullptr, FALSE);
+      }
+      SetWindowPos(
+          hWnd, placement->insert_after, placement->x, placement->y, placement->width, placement->height,
+          SWP_NOACTIVATE | SWP_SHOWWINDOW
+      );
+    } else {
+      SetWindowPos(hWnd, nullptr, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_HIDEWINDOW);
+    }
+    delete placement;
+    return 0;
+  }
+  return DefWindowProcA(hWnd, msg, wParam, lParam);
+}
+
+HRESULT
+CreateCompositionSwapChain(
+    IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGISwapChain1 **ppSwapChain
+) {
+  if (pDesc == NULL || ppSwapChain == NULL)
+    return DXGI_ERROR_INVALID_CALL;
+  InitReturnPtr(ppSwapChain);
+
+  /* The swap chain is not tied to a window, but it needs the size and monitor of one. The window is hidden, is never
+   * presented to and belongs to the swap chain, which destroys it. */
+  HWND hWnd = CompositionWindowThread::Get().CreatePlacedWindow(pDesc->Width, pDesc->Height);
+  if (!hWnd)
+    return E_FAIL;
+
+  DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
+  HRESULT hr = CreateSwapChain(pFactory, pDevice, hWnd, &desc, nullptr, ppSwapChain, true);
+  if (FAILED(hr))
+    CompositionWindowThread::Get().DestroyPlacedWindow(hWnd);
+  else
+    (*ppSwapChain)->SetPrivateData(kMNCCompositionWindow, sizeof(hWnd), &hWnd);
+  return hr;
+}
 
 } // namespace dxmt

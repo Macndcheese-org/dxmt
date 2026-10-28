@@ -1101,6 +1101,13 @@ public:
     return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
+  HRESULT STDMETHODCALLTYPE
+  CreateCompositionSwapChain(
+      IDXGIFactory1 *pFactory, const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGISwapChain1 **ppSwapChain
+  ) override {
+    return dxmt::CreateCompositionSwapChain(pFactory, this, pDesc, ppSwapChain);
+  }
+
 private:
   MTLDXGIObject<IMTLDXGIDevice> *container_;
   D3D_FEATURE_LEVEL feature_level_;
@@ -1300,6 +1307,11 @@ public:
 
     return dxmt::CreateSwapChain(pFactory, &d3d11_device_, hWnd, pDesc, pFullscreenDesc,
                                  ppSwapChain);
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateCompositionSwapChain(
+      IDXGIFactory1 *pFactory, const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGISwapChain1 **ppSwapChain) override {
+    return dxmt::CreateCompositionSwapChain(pFactory, &d3d11_device_, pDesc, ppSwapChain);
   }
 
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
