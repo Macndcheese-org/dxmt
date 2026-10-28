@@ -139,6 +139,7 @@ public:
       device_context_(pDevice->GetImmediateContextPrivate()),
       hWnd(hWnd),
       composition_(composition),
+      composition_present_(composition && env::getEnvVar("DXMT_COMPOSITION_PRESENT") == "1"),
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
@@ -242,7 +243,7 @@ public:
    * as before. */
   void EnsurePresentTarget() {
     /* A composition swap chain is never put on a window: the compositor reads its back buffer. */
-    if (composition_ || presenter != nullptr)
+    if ((composition_ && !composition_present_) || presenter != nullptr)
       return;
 
     HDC hdc = GetDC(hWnd);
@@ -871,7 +872,7 @@ public:
     auto &cmd_queue = device_->GetDXMTDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
-    if (composition_) {
+    if (composition_ && !composition_present_) {
       /* Nothing to show: the content is what the compositor reads from the back buffer. Only
        * submit the work and let the frame-latency accounting run. */
       chunk->emitcc([this, sync_state = SyncFrame(++presentation_count_)](ArgumentEncodingContext &) mutable {
@@ -1187,6 +1188,9 @@ private:
   /* the swap chain was created by CreateSwapChainForComposition: hWnd is a hidden window of its own, kept only so the
    * swap chain has the surface size and monitor of a window-bound one */
   bool composition_;
+  /* Prototype: a composition swap chain also presents its back buffer into the Metal layer of its own window, so
+   * that the window system can show the visual without the compositor reading the buffer back. */
+  bool composition_present_;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
   wsi::DXMTWindowState window_state_;
@@ -1267,6 +1271,8 @@ CreateCompositionSwapChain(
   );
   if (!hWnd)
     return E_FAIL;
+  if (env::getEnvVar("DXMT_COMPOSITION_WINDOW_VISIBLE") == "1")
+    SetWindowPos(hWnd, HWND_TOPMOST, 100, 100, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
   DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
   HRESULT hr = CreateSwapChain(pFactory, pDevice, hWnd, &desc, nullptr, ppSwapChain, true);
