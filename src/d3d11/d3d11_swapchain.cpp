@@ -241,6 +241,27 @@ public:
    * window with the backbuffer's initial contents. Deferring the acquire leaves
    * a render-only chain's window alone; the first real Present binds it exactly
    * as before. */
+  /* The Metal layer of a window is tied to its toplevel window: a window that is moved under another one (a
+   * composition swap chain whose window the compositor puts into the window the visual is shown in) needs its layer
+   * acquired again. */
+  void ReleasePresentTarget() {
+    device_context_->WaitUntilGPUIdle();
+    presenter = nullptr;
+    if (client_surface_ != nullptr) {
+      HDC hdc = GetDC(hWnd);
+      struct macdrv_escape_surface surfaceInfo = {0};
+      surfaceInfo.surface = client_surface_.handle;
+      ExtEscape(hdc, MACDRV_ESCAPE_RELEASE_SURFACE, sizeof(surfaceInfo), (LPCSTR)&surfaceInfo, 0, NULL);
+      ReleaseDC(hWnd, hdc);
+    } else if (native_view_ != nullptr) {
+      WMT::ReleaseMetalView(native_view_);
+    }
+    client_surface_ = {};
+    native_view_ = {};
+    layer_weak_ = {};
+    root_hwnd_ = nullptr;
+  }
+
   void EnsurePresentTarget() {
     /* A composition swap chain is never put on a window: the compositor reads its back buffer. */
     if ((composition_ && !composition_present_) || presenter != nullptr)
@@ -269,6 +290,7 @@ public:
       abort();
     }
 
+    root_hwnd_ = GetAncestor(hWnd, GA_ROOT);
     Logger::info(str::format("DXGI: present target hwnd=", reinterpret_cast<uintptr_t>(hWnd),
                              " size=", desc_.Width, "x", desc_.Height));
 
@@ -836,6 +858,8 @@ public:
     // First Present is what binds this window's CAMetalLayer: a chain the app
     // only ever renders into never reaches here, so it never covers its window
     // (see EnsurePresentTarget). No-op once the target is up.
+    if (composition_present_ && presenter != nullptr && GetAncestor(hWnd, GA_ROOT) != root_hwnd_)
+      ReleasePresentTarget();
     EnsurePresentTarget();
 
     HRESULT hr = S_OK;
@@ -1191,6 +1215,7 @@ private:
   /* Prototype: a composition swap chain also presents its back buffer into the Metal layer of its own window, so
    * that the window system can show the visual without the compositor reading the buffer back. */
   bool composition_present_;
+  HWND root_hwnd_ = nullptr;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
   wsi::DXMTWindowState window_state_;
