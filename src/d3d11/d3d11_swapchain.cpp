@@ -234,7 +234,7 @@ public:
       device_context_(pDevice->GetImmediateContextPrivate()),
       hWnd(hWnd),
       composition_(composition),
-      composition_present_(composition && env::getEnvVar("DXMT_COMPOSITION_PRESENT") == "1"),
+      composition_present_(composition && env::getEnvVar("DXMT_COMPOSITION_PRESENT") != "0"),
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
@@ -339,6 +339,10 @@ public:
   /* The Metal layer of a window is tied to its toplevel window: a window that is moved under another one (a
    * composition swap chain whose window the compositor puts into the window the visual is shown in) needs its layer
    * acquired again. */
+  /* A composition swap chain presents to its window while the compositor shows that window in the window of a
+   * visual. Otherwise the compositor reads the back buffer. */
+  bool PresentsToWindow() { return composition_ && composition_present_ && IsWindowVisible(hWnd); }
+
   void ReleasePresentTarget() {
     device_context_->WaitUntilGPUIdle();
     presenter = nullptr;
@@ -359,7 +363,7 @@ public:
 
   void EnsurePresentTarget() {
     /* A composition swap chain is never put on a window: the compositor reads its back buffer. */
-    if ((composition_ && !composition_present_) || presenter != nullptr)
+    if ((composition_ && !PresentsToWindow()) || presenter != nullptr)
       return;
 
     HDC hdc = GetDC(hWnd);
@@ -991,7 +995,7 @@ public:
     auto &cmd_queue = device_->GetDXMTDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
-    if (composition_ && !composition_present_) {
+    if (composition_ && !PresentsToWindow()) {
       /* Nothing to show: the content is what the compositor reads from the back buffer. Only
        * submit the work and let the frame-latency accounting run. */
       chunk->emitcc([this, sync_state = SyncFrame(++presentation_count_)](ArgumentEncodingContext &) mutable {
@@ -1307,8 +1311,9 @@ private:
   /* the swap chain was created by CreateSwapChainForComposition: hWnd is a hidden window of its own, kept only so the
    * swap chain has the surface size and monitor of a window-bound one */
   bool composition_;
-  /* Prototype: a composition swap chain also presents its back buffer into the Metal layer of its own window, so
-   * that the window system can show the visual without the compositor reading the buffer back. */
+  /* A composition swap chain also presents its back buffer into the Metal layer of its own window, so that the
+   * window system can show the visual without the compositor reading the buffer back. DXMT_COMPOSITION_PRESENT=0
+   * leaves the buffer to the compositor. */
   bool composition_present_;
   HWND root_hwnd_ = nullptr;
   HMONITOR monitor_;
