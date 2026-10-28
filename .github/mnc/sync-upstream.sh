@@ -27,10 +27,17 @@ label="upstream-sync"
 
 gh_() { if [ -n "${DRY_RUN:-}" ]; then echo "[dry run] gh $*"; else gh "$@"; fi; }
 
+# a fork starts with its issues disabled
+issues_enabled() { [ "$(gh api "repos/$repo" --jq .has_issues)" = true ]; }
+
 open_issue() {
+  issues_enabled || return 0
   gh api "repos/$repo/issues?labels=$label&state=open&per_page=100" \
     --jq ".[] | select(.title == \"$title\") | .number" | head -1
 }
+
+# set when something needs a person and could not be put in an issue: the job then ends red
+attention=0
 
 # report <upstream sha> <what happened>: one open issue per branch, updated when upstream moves on
 report() {
@@ -39,6 +46,12 @@ report() {
 
 <!-- upstream-sha: $sha -->"
   [ -z "${DRY_RUN:-}" ] || { echo "[dry run] issue: $title"; echo "$body"; return 0; }
+  if ! issues_enabled; then
+    echo "::error::$title (issues are disabled on $repo: enable them in Settings > General > Features to get an issue)"
+    printf '## %s\n\n%s\n' "$title" "$body" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    attention=1
+    return 0
+  fi
   number=$(open_issue)
   if [ -z "$number" ]; then
     gh label create "$label" --repo "$repo" --color FBCA04 --force
@@ -92,7 +105,7 @@ git push origin sync-$branch:$branch
 
 This issue closes itself once \`$branch\` is up to date."
   echo "::warning::$branch: merging $upstream conflicts, see the issue"
-  exit 0
+  exit "$attention"
 fi
 
 if [ -n "${DRY_RUN:-}" ]; then
@@ -110,7 +123,7 @@ Merge it by hand (see the commands in the README of \`.github/mnc\`), or add a \
 
 This issue closes itself once \`$branch\` is up to date."
       echo "::warning::$branch: the token cannot push workflow changes, see the issue"
-      exit 0 ;;
+      exit "$attention" ;;
     *rejected*|*"fetch first"*)
       echo "::warning::$branch moved while it was merged; the next run tries again"
       exit 0 ;;

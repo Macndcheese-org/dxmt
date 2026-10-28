@@ -202,8 +202,15 @@ jobs:
         with:
           tools: mingw-w64
 
+      # d3d9-core/ imports <Metal/MTL4CommandQueue.h>, which only the macOS 26 SDK (Xcode 26) has
       - name: Select Xcode Version
-        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          [ -n "$xcode" ] || { echo "::error::no Xcode 26 on this runner"; exit 1; }
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          # Xcode 26 ships the Metal compiler as a separate component
+          xcrun -sdk macosx metal --version || { xcodebuild -downloadComponent MetalToolchain && xcrun -sdk macosx metal --version; }
 
       - name: Install Meson
         run: pip3 install meson==1.10.0 --break-system-packages
@@ -260,6 +267,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # a fork starts with its issues disabled; the failed build already turns the run red
+          [ "$(gh api "repos/${{ github.repository }}" --jq .has_issues)" = true ] || { echo "::warning::issues are disabled, no build-failure issue"; exit 0; }
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           TITLE="build: ${{ github.ref_name }} failed to build (${{ github.sha }})"
           # gh issue create fails when a label does not exist; a fork starts with the default ones only
