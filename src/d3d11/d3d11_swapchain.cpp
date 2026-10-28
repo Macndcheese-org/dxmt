@@ -195,10 +195,16 @@ private:
     while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
       if (!msg.hwnd && msg.message == kCreateMessage) {
         auto *request = reinterpret_cast<Request *>(msg.lParam);
+        /* A layered window with the transparent style is skipped when the window under the mouse is looked for, in
+         * every thread and process: the mouse goes to the window the visual is shown in, as it does on Windows. */
         request->result = CreateWindowExA(
-            WS_EX_NOACTIVATE, class_name, nullptr, WS_POPUP, 0, 0, std::max<UINT>(request->width, 1),
-            std::max<UINT>(request->height, 1), nullptr, nullptr, wc.hInstance, nullptr
+            WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, class_name, nullptr, WS_POPUP, 0, 0,
+            std::max<UINT>(request->width, 1), std::max<UINT>(request->height, 1), nullptr, nullptr, wc.hInstance,
+            nullptr
         );
+        if (request->result)
+          SetLayeredWindowAttributes(request->result, 0, 255, LWA_ALPHA);
+
         SetEvent(request->done);
         continue;
       }
